@@ -5,7 +5,16 @@ import jsPDF from "jspdf";
 import autoTable from "jspdf-autotable";
 import Tesseract from "tesseract.js";
 
-// ─── Constants ────────────────────────────────────────────────────────────────
+// ─── Color tokens ─────────────────────────────────────────────────────────────
+const C = {
+  navy: "#101828", // main background
+  light: "#f9f8f8", // text / light surfaces
+  cream: "#f9f4cf", // accent / CTA
+  navy2: "#1a2740", // card surface (slightly lighter than navy)
+  border: "rgba(249,244,207,0.18)", // cream at low opacity
+};
+
+// ─── Calculation constants ────────────────────────────────────────────────────
 const MONTHS_FR = [
   "Jan",
   "Fév",
@@ -34,65 +43,63 @@ const MONTHS_FULL_FR = [
   "Novembre",
   "Décembre",
 ];
-const DAYS_IN_MONTH = [31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31];
 
-// Biskra reference monthly production (kWh) for 285.13 kWp, PR=0.80, GHI=5.5 kWh/m²/day
-// Source: Université de Biskra Thesis 2025-2026 Table 3.9
+// Biskra thesis (Univ. Biskra 2025-2026) — monthly PV distribution for 285.13 kWp, PR=80%, GHI=5.5
 const BISKRA_MONTHLY_PROD = [
   28534, 30958, 40218, 41536, 47221, 46487, 47587, 45896, 39322, 36188, 27793,
   26180,
 ];
-const BISKRA_E_ANNUAL = 457919; // kWh/yr — reference value
+const BISKRA_E_ANNUAL = 457919; // kWh/yr reference
 
-// Financial constants
-const CO2_FACTOR = 0.55; // kg CO₂/kWh — Algeria grid emission factor
-const HP_TARIFF_NM = 1.8064; // DA/kWh — H.Pointe tariff for net metering revenue
-const TREES_PER_TCO2 = 45; // trees equivalent per tCO₂ absorbed
-const VEHICLES_TCO2_YR = 2.3; // tCO₂/yr per average vehicle
+// Financial / environmental
+const CO2_FACTOR = 0.55; // kg CO₂/kWh — Algerian grid
+const NM_TARIFF = 1.8064; // DA/kWh — net metering rate (H.Hors Pointe)
+const TREES_PER_TCO2 = 45;
+const VEHICLES_TCO2_YR = 2.3;
 
-// ─── Types ────────────────────────────────────────────────────────────────────
+// ─── TypeScript interfaces ────────────────────────────────────────────────────
 interface BillData {
-  hp_kwh: number;
-  peak_kwh: number;
-  total_da: number;
-  month: number;
+  hp_kwh: number; // Heures Hors Pointe (Cadran 1 + 2) — off-peak kWh
+  peak_kwh: number; // Heures de Pointe   (Cadran 3)     — peak kWh
+  total_da: number; // Net à Payer / TOTAL FACTURE in DA
+  month: number; // 1–12
   year: number;
 }
 
 interface BillSlot {
   file: File | null;
   preview: string | null;
-  status: "empty" | "processing" | "done" | "error";
+  status: "empty" | "processing" | "done";
   data: BillData | null;
   edited: BillData | null;
-  error?: string;
+  ocrWarn: string; // non-blocking OCR warning shown to user
 }
 
 interface SystemParams {
   building_name: string;
   building_address: string;
-  p_installed: number;
-  ghi_annual: number;
-  pr: number;
-  capex: number;
+  p_installed: number; // kWp
+  ghi_annual: number; // kWh/m²/day
+  pr: number; // Performance Ratio %
+  capex: number; // DA
   n_modules: number;
   module_brand: string;
   module_model: string;
-  module_power: number;
+  module_power: number; // Wp
   inverter_brand: string;
   n_inverters: number;
-  tilt: number;
+  tilt: number; // degrees
   orientation: string;
-  roof_area: number;
+  roof_area: number; // m²
 }
 
 interface FinancialParams {
-  r: number;
-  f: number;
-  D: number;
-  om_rate: number;
-  DS: number;
-  subsidy_rate: number;
+  r: number; // discount rate %
+  f: number; // tariff inflation rate %
+  D: number; // module degradation %/yr
+  om_rate: number; // O&M as % of CAPEX
+  DS: number; // demand savings DA/yr — FIXED, never inflated
+  subsidy_rate: number; // % for Scenario 2
 }
 
 interface DCFRow {
@@ -146,112 +153,108 @@ interface StudyResults {
   vehicles_equiv: number;
 }
 
-// ─── Calculation Engine ───────────────────────────────────────────────────────
+// ─── IRR bisection solver ──────────────────────────────────────────────────────
 function calcIRR(cashflows: number[], investment: number): number {
-  const npvFn = (r: number) =>
+  const npv = (r: number) =>
     cashflows.reduce(
       (acc, cf, i) => acc + cf / Math.pow(1 + r, i + 1),
       -investment,
     );
-
-  if (npvFn(0.001) <= 0) return 0;
+  if (npv(0.001) <= 0) return 0;
   let lo = 0.001,
     hi = 3.0;
-  if (npvFn(hi) > 0) return hi;
+  if (npv(hi) > 0) return hi;
   for (let i = 0; i < 200; i++) {
     const mid = (lo + hi) / 2;
-    npvFn(mid) > 0 ? (lo = mid) : (hi = mid);
+    npv(mid) > 0 ? (lo = mid) : (hi = mid);
   }
   return (lo + hi) / 2;
 }
 
+// ─── Main calculation engine (IEC 61724-1:2021 + PRD Biskra methodology) ──────
 function runStudy(
   bills: BillSlot[],
   sys: SystemParams,
   fin: FinancialParams,
 ): StudyResults {
-  // 1 — Build monthly consumption array (index 0 = January)
+  // 1 — Build monthly consumption from bills
   const monthly_cons = new Array(12).fill(0);
   let total_da = 0;
   let total_kwh = 0;
 
-  const validBills = bills.filter((b) => b.edited?.month != null);
-  validBills.forEach((b) => {
-    const d = b.edited!;
-    const idx = d.month - 1; // 0-based
-    const cons = (d.hp_kwh || 0) + (d.peak_kwh || 0);
-    monthly_cons[idx] = cons;
-    total_da += d.total_da || 0;
-    total_kwh += cons;
-  });
+  bills
+    .filter(
+      (b) =>
+        b.status === "done" && b.edited !== null && (b.edited.month ?? 0) >= 1,
+    )
+    .forEach((b) => {
+      const d = b.edited!;
+      const idx = d.month - 1;
+      if (idx < 0 || idx > 11) return;
+      const cons = (d.hp_kwh || 0) + (d.peak_kwh || 0);
+      monthly_cons[idx] = Math.max(monthly_cons[idx], cons); // keep largest if duplicates
+      total_da += d.total_da || 0;
+      total_kwh += cons;
+    });
 
-  // Fill missing months with average
-  const filledMonths = monthly_cons.filter((v) => v > 0);
+  // Fill empty months with average of provided months
+  const filled = monthly_cons.filter((v) => v > 0);
   const avgCons =
-    filledMonths.length > 0
-      ? filledMonths.reduce((a, b) => a + b, 0) / filledMonths.length
+    filled.length > 0
+      ? filled.reduce((a, b) => a + b, 0) / filled.length
       : 10000;
-  const monthly_cons_filled = monthly_cons.map((v) => (v > 0 ? v : avgCons));
+  const monthly_cons_f = monthly_cons.map((v) => (v > 0 ? v : avgCons));
 
-  // 2 — Annual energy production (IEC 61724-1:2021)
+  // 2 — Annual energy yield E_annual (IEC 61724-1:2021 Eq. 3.1)
   const e_annual = sys.p_installed * sys.ghi_annual * (sys.pr / 100) * 365;
   const fleh = e_annual / sys.p_installed;
 
-  // 3 — Monthly PV production (scaled from Biskra distribution)
+  // 3 — Monthly PV production — scale from Biskra distribution
   const scale = e_annual / BISKRA_E_ANNUAL;
   const monthly_pv = BISKRA_MONTHLY_PROD.map((v) => Math.round(v * scale));
 
-  // 4 — SCR computation — NEVER use fixed value (per PRD critical requirement)
+  // 4 — SCR: min(E_PV,m, E_cons,m) per month — NEVER use fixed value
   const monthly_sc = monthly_pv.map((pv, i) =>
-    Math.round(Math.min(pv, monthly_cons_filled[i])),
+    Math.round(Math.min(pv, monthly_cons_f[i])),
   );
   const e_self_yr1 = monthly_sc.reduce((a, b) => a + b, 0);
   const scr = (e_self_yr1 / e_annual) * 100;
-  const exported = e_annual - e_self_yr1;
+  const exported = Math.round(e_annual - e_self_yr1);
   const monthly_scr = monthly_pv.map((pv, i) =>
     pv > 0 ? Math.round((monthly_sc[i] / pv) * 100) : 0,
   );
 
-  // 5 — Weighted tariff (MANDATORY: Σ invoices_DA / Σ consumption_kWh)
+  // 5 — Weighted tariff T₀ = Σ(DA) / Σ(kWh) — MANDATORY method
   const t0 = total_kwh > 0 ? total_da / total_kwh : 4.8018;
 
-  // 6 — Year 1 financial
+  // 6 — Year-1 financials
   const om_annual = sys.capex * (fin.om_rate / 100);
   const yr1_energy_savings = e_self_yr1 * t0;
-  const yr1_gross_savings = yr1_energy_savings + fin.DS;
+  const yr1_gross_savings = yr1_energy_savings + fin.DS; // DS is FIXED
   const yr1_net_cf = yr1_gross_savings - om_annual;
-  const spp_sc1 = sys.capex / yr1_gross_savings;
   const capex_sc2 = sys.capex * (1 - fin.subsidy_rate / 100);
+  const spp_sc1 = sys.capex / yr1_gross_savings;
   const spp_sc2 = capex_sc2 / yr1_gross_savings;
 
-  // 7 — 25-year DCF loop (CRITICAL: DS is FIXED — never inflated)
-  const D = fin.D / 100;
-  const r = fin.r / 100;
-  const f = fin.f / 100;
-
+  // 7 — 25-year DCF (DS NEVER inflated — PRD critical requirement)
+  const D_dec = fin.D / 100;
+  const r_dec = fin.r / 100;
+  const f_dec = fin.f / 100;
   let cum_sc1 = -sys.capex;
-  let cum_sc2 = -capex_sc2;
-  let dpp_sc1: number | null = null;
-  let dpp_sc2: number | null = null;
   const dcf_table: DCFRow[] = [];
   const cashflows: number[] = [];
+  let dpp_sc1: number | null = null;
 
   for (let n = 1; n <= 25; n++) {
-    const e_self_n = e_self_yr1 * Math.pow(1 - D, n - 1);
-    const t_n = t0 * Math.pow(1 + f, n - 1);
-    const ds_n = fin.DS; // ⚠️ FIXED — NEVER inflate
+    const e_self_n = e_self_yr1 * Math.pow(1 - D_dec, n - 1);
+    const t_n = t0 * Math.pow(1 + f_dec, n - 1);
     const energy_savings = e_self_n * t_n;
-    const gross_savings = energy_savings + ds_n;
+    const gross_savings = energy_savings + fin.DS; // DS FIXED
     const net_cf = gross_savings - om_annual;
-    const dcf = net_cf / Math.pow(1 + r, n);
-
+    const dcf = net_cf / Math.pow(1 + r_dec, n);
     cashflows.push(net_cf);
     cum_sc1 += dcf;
-    cum_sc2 += dcf;
-
     if (cum_sc1 >= 0 && dpp_sc1 === null) dpp_sc1 = n;
-    if (cum_sc2 >= 0 && dpp_sc2 === null) dpp_sc2 = n;
-
     dcf_table.push({
       year: n,
       e_self_n: Math.round(e_self_n),
@@ -263,27 +266,22 @@ function runStudy(
       net_cf: Math.round(net_cf),
       dcf: Math.round(dcf),
       cum_sc1: Math.round(cum_sc1),
-      cum_sc2: Math.round(cum_sc2),
+      cum_sc2: 0,
     });
   }
 
-  // Fix SC2 cumulative (same CFs, lower initial CAPEX)
+  // SC2: same CFs, lower initial CAPEX
   const subsidy_offset = sys.capex * (fin.subsidy_rate / 100);
+  let dpp_sc2: number | null = null;
   dcf_table.forEach((row) => {
     row.cum_sc2 = row.cum_sc1 + subsidy_offset;
+    if (row.cum_sc2 >= 0 && dpp_sc2 === null) dpp_sc2 = row.year;
   });
-  dpp_sc2 = null;
-  for (const row of dcf_table) {
-    if (row.cum_sc2 >= 0 && dpp_sc2 === null) {
-      dpp_sc2 = row.year;
-      break;
-    }
-  }
 
   const npv_sc1 = cum_sc1;
   const npv_sc2 = npv_sc1 + subsidy_offset;
 
-  // 8 — IRR (bisection, 6 decimal precision)
+  // 8 — IRR
   const irr_sc1 = calcIRR(cashflows, sys.capex);
   const irr_sc2 = calcIRR(cashflows, capex_sc2);
 
@@ -291,12 +289,13 @@ function runStudy(
   let pv_om = 0,
     pv_energy = 0;
   for (let n = 1; n <= 25; n++) {
-    pv_om += om_annual / Math.pow(1 + r, n);
-    pv_energy += (e_annual * Math.pow(1 - D, n - 1)) / Math.pow(1 + r, n);
+    pv_om += om_annual / Math.pow(1 + r_dec, n);
+    pv_energy +=
+      (e_annual * Math.pow(1 - D_dec, n - 1)) / Math.pow(1 + r_dec, n);
   }
   const lcoe = (sys.capex + pv_om) / pv_energy;
 
-  // 10 — PI
+  // 10 — Profitability Index
   const pi_sc1 = 1 + npv_sc1 / sys.capex;
   const pi_sc2 = 1 + npv_sc2 / capex_sc2;
 
@@ -304,9 +303,8 @@ function runStudy(
   const co2_yr1 = (e_annual * CO2_FACTOR) / 1000;
   let co2_25yr = 0;
   for (let n = 0; n < 25; n++)
-    co2_25yr += (e_annual * Math.pow(1 - D, n) * CO2_FACTOR) / 1000;
-
-  const nm_revenue = exported * HP_TARIFF_NM;
+    co2_25yr += (e_annual * Math.pow(1 - D_dec, n) * CO2_FACTOR) / 1000;
+  const nm_revenue = exported * NM_TARIFF;
   const trees_equiv = Math.round(co2_yr1 * TREES_PER_TCO2);
   const vehicles_equiv = Math.round(co2_yr1 / VEHICLES_TCO2_YR);
 
@@ -314,12 +312,12 @@ function runStudy(
     e_annual: Math.round(e_annual),
     fleh: Math.round(fleh),
     monthly_pv,
-    monthly_cons: monthly_cons_filled.map(Math.round),
+    monthly_cons: monthly_cons_f.map(Math.round),
     monthly_sc,
     monthly_scr,
     scr: parseFloat(scr.toFixed(2)),
     e_self_yr1: Math.round(e_self_yr1),
-    exported: Math.round(exported),
+    exported,
     t0: parseFloat(t0.toFixed(4)),
     total_da: Math.round(total_da),
     total_kwh: Math.round(total_kwh),
@@ -348,15 +346,15 @@ function runStudy(
   };
 }
 
-// ─── Chart Helpers (Canvas → base64 PNG for PDF embedding) ────────────────────
+// ─── Canvas chart helpers (no emoji — jsPDF Helvetica doesn't support them) ───
 function makeBarChart(
   vals1: number[],
   vals2: number[] | null,
   labels: string[],
   w: number,
   h: number,
-  color1 = "#f59e0b",
-  color2 = "#3b82f6",
+  color1 = C.cream,
+  color2 = C.navy,
   title = "",
 ): string {
   const cvs = document.createElement("canvas");
@@ -366,13 +364,12 @@ function makeBarChart(
   ctx.fillStyle = "#ffffff";
   ctx.fillRect(0, 0, w, h);
 
-  const pad = { t: title ? 28 : 14, r: 16, b: 36, l: 56 };
+  const pad = { t: title ? 28 : 14, r: 16, b: 36, l: 58 };
   const cw = w - pad.l - pad.r;
   const ch = h - pad.t - pad.b;
-  const allVals = [...vals1, ...(vals2 || [])];
-  const maxV = Math.max(...allVals) * 1.15 || 1;
-  const groups = vals1.length;
-  const gw = cw / groups;
+  const all = [...vals1, ...(vals2 || [])];
+  const maxV = (Math.max(...all) || 1) * 1.15;
+  const gw = cw / vals1.length;
   const bw = gw * (vals2 ? 0.38 : 0.62);
 
   if (title) {
@@ -381,8 +378,6 @@ function makeBarChart(
     ctx.textAlign = "center";
     ctx.fillText(title, w / 2, 16);
   }
-
-  // Grid
   for (let i = 0; i <= 4; i++) {
     const y = pad.t + ch - (ch * i) / 4;
     ctx.strokeStyle = "#e5e7eb";
@@ -401,7 +396,6 @@ function makeBarChart(
       y + 3,
     );
   }
-
   vals1.forEach((v, i) => {
     const x = pad.l + i * gw;
     const bh = (v / maxV) * ch;
@@ -413,8 +407,7 @@ function makeBarChart(
       bh,
     );
     if (vals2) {
-      const v2 = vals2[i];
-      const bh2 = (v2 / maxV) * ch;
+      const bh2 = (vals2[i] / maxV) * ch;
       ctx.fillStyle = color2;
       ctx.fillRect(x + gw * 0.52, pad.t + ch - bh2, bw, bh2);
     }
@@ -423,8 +416,6 @@ function makeBarChart(
     ctx.textAlign = "center";
     ctx.fillText(labels[i], x + gw / 2, h - pad.b + 14);
   });
-
-  // Axes
   ctx.strokeStyle = "#374151";
   ctx.lineWidth = 1.2;
   ctx.beginPath();
@@ -432,7 +423,6 @@ function makeBarChart(
   ctx.lineTo(pad.l, pad.t + ch);
   ctx.lineTo(pad.l + cw, pad.t + ch);
   ctx.stroke();
-
   return cvs.toDataURL("image/png");
 }
 
@@ -442,8 +432,6 @@ function makeLineChart(
   labels: string[],
   w: number,
   h: number,
-  label1 = "Sc1 (sans subvention)",
-  label2 = "Sc2 (avec subvention)",
 ): string {
   const cvs = document.createElement("canvas");
   cvs.width = w;
@@ -452,19 +440,16 @@ function makeLineChart(
   ctx.fillStyle = "#ffffff";
   ctx.fillRect(0, 0, w, h);
 
-  const pad = { t: 30, r: 20, b: 40, l: 72 };
+  const pad = { t: 32, r: 20, b: 40, l: 74 };
   const cw = w - pad.l - pad.r;
   const ch = h - pad.t - pad.b;
-
-  const allD = [...data1, ...data2];
-  const minV = Math.min(...allD) * (Math.min(...allD) < 0 ? 1.1 : 0.9);
-  const maxV = Math.max(...allD) * 1.1;
+  const all = [...data1, ...data2];
+  const minV = Math.min(...all) * (Math.min(...all) < 0 ? 1.1 : 0.9);
+  const maxV = Math.max(...all) * 1.1;
   const range = maxV - minV || 1;
-
   const getX = (i: number) => pad.l + (i / (data1.length - 1)) * cw;
   const getY = (v: number) => pad.t + ch - ((v - minV) / range) * ch;
 
-  // Zero line
   if (minV < 0 && maxV > 0) {
     const zy = getY(0);
     ctx.strokeStyle = "#ef4444";
@@ -478,10 +463,8 @@ function makeLineChart(
     ctx.fillStyle = "#ef4444";
     ctx.font = "8px Arial";
     ctx.textAlign = "left";
-    ctx.fillText("Breakeven", pad.l + 2, zy - 3);
+    ctx.fillText("Seuil de rentabilite", pad.l + 2, zy - 3);
   }
-
-  // Grid
   for (let i = 0; i <= 4; i++) {
     const v = minV + (range * i) / 4;
     const y = getY(v);
@@ -494,31 +477,25 @@ function makeLineChart(
     ctx.fillStyle = "#9ca3af";
     ctx.font = "9px Arial";
     ctx.textAlign = "right";
-    const label =
+    const lbl =
       Math.abs(v) >= 1e6
         ? (v / 1e6).toFixed(1) + "M"
         : Math.round(v / 1000) + "k";
-    ctx.fillText(label, pad.l - 4, y + 3);
+    ctx.fillText(lbl, pad.l - 4, y + 3);
   }
-
   const drawLine = (data: number[], color: string, dash = false) => {
     if (dash) ctx.setLineDash([6, 3]);
     ctx.strokeStyle = color;
-    ctx.lineWidth = 2;
+    ctx.lineWidth = 2.5;
     ctx.beginPath();
     data.forEach((v, i) => {
-      const x = getX(i),
-        y = getY(v);
-      i === 0 ? ctx.moveTo(x, y) : ctx.lineTo(x, y);
+      i === 0 ? ctx.moveTo(getX(i), getY(v)) : ctx.lineTo(getX(i), getY(v));
     });
     ctx.stroke();
     ctx.setLineDash([]);
   };
-
-  drawLine(data1, "#f59e0b");
-  drawLine(data2, "#3b82f6", true);
-
-  // X labels every 5 years
+  drawLine(data1, C.cream);
+  drawLine(data2, "#60a5fa", true);
   ctx.fillStyle = "#374151";
   ctx.font = "9px Arial";
   ctx.textAlign = "center";
@@ -526,8 +503,6 @@ function makeLineChart(
     if (i % 5 === 0 || i === labels.length - 1)
       ctx.fillText(l, getX(i), h - pad.b + 14);
   });
-
-  // Axes
   ctx.strokeStyle = "#374151";
   ctx.lineWidth = 1.2;
   ctx.beginPath();
@@ -535,22 +510,20 @@ function makeLineChart(
   ctx.lineTo(pad.l, pad.t + ch);
   ctx.lineTo(pad.l + cw, pad.t + ch);
   ctx.stroke();
-
   // Legend
-  ctx.fillStyle = "#f59e0b";
-  ctx.fillRect(pad.l, 8, 20, 7);
+  ctx.fillStyle = C.cream;
+  ctx.fillRect(pad.l, 8, 18, 7);
   ctx.fillStyle = "#374151";
   ctx.font = "9px Arial";
   ctx.textAlign = "left";
-  ctx.fillText(label1, pad.l + 24, 15);
-  ctx.fillStyle = "#3b82f6";
-  ctx.fillRect(pad.l + 130, 8, 20, 7);
-  ctx.fillText(label2, pad.l + 154, 15);
-
+  ctx.fillText("Sc1 (sans subvention)", pad.l + 22, 15);
+  ctx.fillStyle = "#60a5fa";
+  ctx.fillRect(pad.l + 140, 8, 18, 7);
+  ctx.fillText("Sc2 (avec subvention)", pad.l + 162, 15);
   return cvs.toDataURL("image/png");
 }
 
-// ─── PDF Generator ────────────────────────────────────────────────────────────
+// ─── PDF report generator ─────────────────────────────────────────────────────
 function generatePDF(
   res: StudyResults,
   sys: SystemParams,
@@ -559,192 +532,205 @@ function generatePDF(
   const doc = new jsPDF({ orientation: "portrait", unit: "mm", format: "a4" });
   const PW = doc.internal.pageSize.getWidth();
   const PH = doc.internal.pageSize.getHeight();
-  let pageNum = 0;
+  // Navy RGB
+  const NAVY = [16, 24, 40] as [number, number, number];
+  const CREAM = [249, 244, 207] as [number, number, number];
+  const WHITE = [249, 248, 248] as [number, number, number];
+  const GRAY = [100, 110, 130] as [number, number, number];
 
-  const fmt = (n: number) => n.toLocaleString("fr-DZ");
-  const fmtDa = (n: number) => fmt(Math.round(n)) + " DA";
+  const fmt = (n: number) => Math.round(n).toLocaleString("fr-DZ");
+  const fmtDA = (n: number) => fmt(n) + " DA";
 
-  const addPage = (showHeader = true) => {
+  let pNum = 1;
+  const addPage = () => {
     doc.addPage();
-    pageNum++;
-    if (showHeader) {
-      doc.setFillColor(245, 158, 11);
-      doc.rect(0, 0, PW, 2, "F");
-      doc.setFontSize(7);
-      doc.setTextColor(150, 150, 150);
-      doc.text(
-        `SolarAnalytics.dz — ${sys.building_name} — Page ${pageNum + 1}`,
-        PW / 2,
-        7,
-        { align: "center" },
-      );
-      doc.setDrawColor(230, 230, 230);
-      doc.line(10, 8, PW - 10, 8);
-    }
+    pNum++;
+    doc.setFillColor(...CREAM);
+    doc.rect(0, 0, PW, 1.5, "F");
+    doc.setFillColor(...NAVY);
+    doc.rect(0, 1.5, PW, 7, "F");
+    doc.setFontSize(7);
+    doc.setTextColor(...CREAM);
+    doc.text(
+      `SolarAnalytics.dz  |  ${sys.building_name}  |  Page ${pNum}`,
+      PW / 2,
+      6.5,
+      { align: "center" },
+    );
+    doc.setDrawColor(220, 220, 220);
+    doc.line(10, 9, PW - 10, 9);
   };
 
-  // ── COVER PAGE ──
-  pageNum = 1;
-  doc.setFillColor(13, 17, 23);
+  // ── PAGE 1: COVER ─────────────────────────────────────────────────────────
+  doc.setFillColor(...NAVY);
   doc.rect(0, 0, PW, PH, "F");
-  doc.setFillColor(245, 158, 11);
-  doc.rect(0, 0, 5, PH, "F");
-  doc.setFillColor(245, 158, 11, 0.08);
-  doc.rect(5, 0, PW - 5, 3, "F");
+  doc.setFillColor(...CREAM);
+  doc.rect(0, 0, 6, PH, "F"); // left accent bar
+  doc.setFillColor(26, 39, 64);
+  doc.rect(6, PH - 60, PW - 6, 60, "F"); // footer band
 
-  doc.setTextColor(245, 158, 11);
+  // Title
   doc.setFont("helvetica", "bold");
-  doc.setFontSize(26);
-  doc.text("SolarAnalytics.dz", 18, 38);
+  doc.setFontSize(24);
+  doc.setTextColor(...CREAM);
+  doc.text("SolarAnalytics.dz", 20, 38);
 
-  doc.setTextColor(255, 255, 255);
-  doc.setFontSize(14);
-  doc.text("Étude de Faisabilité Technico-Économique", 18, 50);
-  doc.setFontSize(11);
+  doc.setFontSize(13);
   doc.setFont("helvetica", "normal");
-  doc.setTextColor(180, 180, 180);
-  doc.text("Système Photovoltaïque Connecté au Réseau (Grid-Tied)", 18, 58);
-
-  doc.setDrawColor(245, 158, 11);
-  doc.setLineWidth(0.4);
-  doc.line(18, 63, PW - 18, 63);
-
-  doc.setTextColor(220, 220, 220);
+  doc.setTextColor(...WHITE);
+  doc.text("Etude de Faisabilite Technico-Economique", 20, 50);
   doc.setFontSize(10);
-  doc.setFont("helvetica", "bold");
-  doc.text("Projet:", 18, 74);
-  doc.setFont("helvetica", "normal");
-  doc.text(sys.building_name, 45, 74);
-  doc.setFont("helvetica", "bold");
-  doc.text("Adresse:", 18, 82);
-  doc.setFont("helvetica", "normal");
-  doc.text(sys.building_address, 45, 82);
-  doc.setFont("helvetica", "bold");
-  doc.text("Puissance:", 18, 90);
-  doc.setFont("helvetica", "normal");
+  doc.setTextColor(...GRAY);
   doc.text(
-    `${sys.p_installed} kWp — ${sys.n_modules} modules ${sys.module_brand} ${sys.module_model}`,
-    45,
-    90,
-  );
-  doc.setFont("helvetica", "bold");
-  doc.text("Date:", 18, 98);
-  doc.setFont("helvetica", "normal");
-  doc.text(
-    new Date().toLocaleDateString("fr-FR", {
-      year: "numeric",
-      month: "long",
-      day: "numeric",
-    }),
-    45,
-    98,
+    "Systeme Photovoltaique Connecte au Reseau — IEC 61724-1:2021",
+    20,
+    58,
   );
 
-  // KPI preview cards
+  doc.setDrawColor(...CREAM);
+  doc.setLineWidth(0.4);
+  doc.line(20, 64, PW - 20, 64);
+
+  // Project info block
+  const infoRows = [
+    ["Projet", sys.building_name],
+    ["Adresse", sys.building_address],
+    [
+      "Puissance",
+      `${sys.p_installed} kWp — ${sys.n_modules} modules ${sys.module_brand} ${sys.module_model}`,
+    ],
+    [
+      "Date",
+      new Date().toLocaleDateString("fr-FR", {
+        year: "numeric",
+        month: "long",
+        day: "numeric",
+      }),
+    ],
+  ];
+  doc.setFontSize(9);
+  infoRows.forEach((row, i) => {
+    const y = 74 + i * 9;
+    doc.setFont("helvetica", "bold");
+    doc.setTextColor(...CREAM);
+    doc.text(row[0] + ":", 20, y);
+    doc.setFont("helvetica", "normal");
+    doc.setTextColor(...WHITE);
+    doc.text(row[1], 50, y);
+  });
+
+  // KPI cards
   const kpis = [
     {
       l: "VAN Sc1",
       v: `${(res.npv_sc1 / 1e6).toFixed(2)} M DA`,
-      good: res.npv_sc1 > 0,
+      ok: res.npv_sc1 > 0,
     },
-    { l: "TRI Sc1", v: `${res.irr_sc1}%`, good: true },
-    { l: "DRS Sc1", v: `${res.dpp_sc1 ?? "N/A"} ans`, good: true },
-    { l: "LCOE", v: `${res.lcoe} DA/kWh`, good: true },
+    { l: "TRI Sc1", v: `${res.irr_sc1}%`, ok: true },
+    { l: "DRA Sc1", v: `${res.dpp_sc1 ?? ">25"} ans`, ok: true },
+    { l: "LCOE", v: `${res.lcoe} DA/kWh`, ok: true },
   ];
   kpis.forEach((k, i) => {
-    const x = 18 + i * 45;
-    doc.setFillColor(25, 35, 55);
-    doc.roundedRect(x, 112, 40, 22, 2, 2, "F");
+    const x = 20 + i * 45;
+    doc.setFillColor(26, 39, 64);
+    doc.roundedRect(x, 116, 41, 22, 2, 2, "F");
     doc.setFont("helvetica", "bold");
-    doc.setFontSize(9);
-    if (k.good) {
-      doc.setTextColor(52, 211, 153);
+    doc.setFontSize(10);
+    if (k.ok) {
+      doc.setTextColor(...CREAM);
     } else {
       doc.setTextColor(239, 68, 68);
     }
-    doc.text(k.v, x + 20, 121, { align: "center" });
+    doc.text(k.v, x + 20.5, 125, { align: "center" });
     doc.setFont("helvetica", "normal");
     doc.setFontSize(7);
-    doc.setTextColor(140, 140, 140);
-    doc.text(k.l, x + 20, 129, { align: "center" });
+    doc.setTextColor(...GRAY);
+    doc.text(k.l, x + 20.5, 132, { align: "center" });
   });
 
   // Methodology note
-  doc.setFontSize(7.5);
-  doc.setTextColor(100, 100, 100);
+  doc.setFontSize(7);
+  doc.setTextColor(...GRAY);
   doc.text(
-    "Méthodologie conforme IEC 61724-1:2021 | Référence: Thèse Université de Biskra 2025-2026",
-    18,
-    144,
+    "SCR calcule mensuellement — min(E_PV,m, E_cons,m) — jamais de valeur fixe supposee",
+    20,
+    148,
   );
   doc.text(
-    "SCR calculé mensuellement (min(E_PV,m, E_cons,m)) — Jamais de valeur fixe supposée",
-    18,
-    150,
+    "Tarif pondere T0 = Somme(DA) / Somme(kWh) sur 12 factures — DS fixe non indexe",
+    20,
+    154,
   );
 
   // Footer
   doc.setFontSize(7);
-  doc.setTextColor(60, 60, 60);
-  doc.text(
-    "© SolarAnalytics.dz — Confidentiel — Tous droits réservés",
-    PW / 2,
-    PH - 12,
-    { align: "center" },
-  );
+  doc.setTextColor(80, 90, 110);
+  doc.text("(c) SolarAnalytics.dz — Confidentiel", PW / 2, PH - 10, {
+    align: "center",
+  });
 
-  // ── PAGE 2: RÉSUMÉ EXÉCUTIF ──
+  // ── PAGE 2: RESUME EXECUTIF ────────────────────────────────────────────────
   addPage();
-  doc.setFont("helvetica", "bold");
-  doc.setFontSize(13);
-  doc.setTextColor(13, 17, 23);
-  doc.text("Résumé Exécutif", 14, 20);
-  doc.setFillColor(245, 158, 11);
-  doc.rect(14, 22, 40, 0.8, "F");
+
+  const hLine = (y: number, label: string) => {
+    doc.setFont("helvetica", "bold");
+    doc.setFontSize(13);
+    doc.setTextColor(...NAVY);
+    doc.text(label, 14, y);
+    doc.setFillColor(...CREAM);
+    doc.rect(14, y + 1.5, 35, 0.8, "F");
+  };
+
+  hLine(20, "Resume Executif");
 
   autoTable(doc, {
-    startY: 27,
+    startY: 26,
     head: [
       [
         "Indicateur",
-        "Scénario 1 (Sans subvention)",
-        "Scénario 2 (Avec subvention 20%)",
-        "Unité",
+        "Scenario 1 — Sans subvention",
+        "Scenario 2 — Avec subvention",
+        "Unite",
       ],
     ],
     body: [
       ["Valeur Actuelle Nette (VAN)", fmt(res.npv_sc1), fmt(res.npv_sc2), "DA"],
       [
-        "Taux de Rentabilité Interne (TRI)",
+        "Taux de Rentabilite Interne (TRI)",
         `${res.irr_sc1}%`,
         `${res.irr_sc2}%`,
         "",
       ],
       [
-        "Délai de Récupération Simple (DRS)",
+        "Delai de Recuperation Simple (DRS)",
         `${res.spp_sc1} ans`,
         `${res.spp_sc2} ans`,
         "ans",
       ],
       [
-        "Délai de Récupération Actualisé (DRA)",
+        "Delai de Recuperation Actualise (DRA)",
         `${res.dpp_sc1 ?? ">25"} ans`,
         `${res.dpp_sc2 ?? ">25"} ans`,
         "ans",
       ],
       [
-        "Indice de Profitabilité (IP)",
+        "Indice de Profitabilite (IP)",
         res.pi_sc1.toFixed(3),
         res.pi_sc2.toFixed(3),
         "",
       ],
       [
-        "Coût Actualisé de l'Énergie (LCOE)",
+        "Cout Actualise de l'Energie (LCOE)",
         res.lcoe.toFixed(2),
         res.lcoe.toFixed(2),
         "DA/kWh",
       ],
-      ["Investissement Initial", fmt(sys.capex), fmt(res.capex_sc2), "DA"],
+      [
+        "Investissement Initial (CAPEX)",
+        fmt(sys.capex),
+        fmt(res.capex_sc2),
+        "DA",
+      ],
       [
         "Economies An 1 (Brutes)",
         fmt(res.yr1_gross_savings),
@@ -753,13 +739,13 @@ function generatePDF(
       ],
     ],
     headStyles: {
-      fillColor: [13, 17, 23],
-      textColor: [245, 158, 11],
+      fillColor: NAVY,
+      textColor: CREAM,
       fontStyle: "bold",
       fontSize: 9,
     },
     bodyStyles: { fontSize: 9 },
-    alternateRowStyles: { fillColor: [249, 250, 251] },
+    alternateRowStyles: { fillColor: [254, 252, 232] },
     columnStyles: {
       1: { halign: "right" },
       2: { halign: "right" },
@@ -767,205 +753,167 @@ function generatePDF(
     },
   });
 
-  const afterSummary = (doc as any).lastAutoTable.finalY + 6;
+  const y2 = (doc as any).lastAutoTable.finalY + 6;
   autoTable(doc, {
-    startY: afterSummary,
-    head: [["Indicateur Technique", "Valeur", "Unité"]],
+    startY: y2,
+    head: [["Indicateur Technique", "Valeur", "Unite"]],
     body: [
-      ["Production annuelle estimée", fmt(res.e_annual), "kWh/an"],
+      ["Production annuelle E_annual", fmt(res.e_annual), "kWh/an"],
       ["Heures pleine charge (FLEH)", fmt(res.fleh), "h/an"],
-      ["Taux d'autoconsommation (SCR) — Calculé", `${res.scr}%`, ""],
-      ["Énergie autoconsommée Année 1", fmt(res.e_self_yr1), "kWh/an"],
-      ["Surplus exporté / Comptage net", fmt(res.exported), "kWh/an"],
-      ["Tarif pondéré calculé (T₀)", res.t0.toFixed(4), "DA/kWh"],
-      ["Dégagement CO₂ évité (Année 1)", `${res.co2_yr1} t`, "tCO₂/an"],
-      ["Revenus comptage net potentiels", fmt(res.nm_revenue), "DA/an"],
+      ["Taux d'autoconsommation (SCR) calcule", `${res.scr}%`, ""],
+      ["Energie autoconsommee An 1", fmt(res.e_self_yr1), "kWh/an"],
+      ["Surplus exporte (comptage net)", fmt(res.exported), "kWh/an"],
+      ["Tarif pondere calcule T0", res.t0.toFixed(4), "DA/kWh"],
+      ["CO2 evite An 1", `${res.co2_yr1} t`, "tCO2/an"],
+      ["Revenus comptage net potentiels", fmtDA(res.nm_revenue), "DA/an"],
     ],
     headStyles: {
-      fillColor: [245, 158, 11],
-      textColor: [13, 17, 23],
+      fillColor: CREAM,
+      textColor: NAVY,
       fontStyle: "bold",
       fontSize: 9,
     },
     bodyStyles: { fontSize: 9 },
-    alternateRowStyles: { fillColor: [255, 253, 235] },
+    alternateRowStyles: { fillColor: [254, 252, 232] },
     columnStyles: { 1: { halign: "right" }, 2: { halign: "center" } },
   });
 
-  // ── PAGE 3: PARAMÈTRES DU SYSTÈME ──
+  // ── PAGE 3: PARAMETRES ─────────────────────────────────────────────────────
   addPage();
-  doc.setFont("helvetica", "bold");
-  doc.setFontSize(13);
-  doc.setTextColor(13, 17, 23);
-  doc.text("Paramètres du Système", 14, 20);
-  doc.setFillColor(245, 158, 11);
-  doc.rect(14, 22, 50, 0.8, "F");
-
+  hLine(20, "Parametres du Systeme");
   autoTable(doc, {
-    startY: 27,
-    head: [["Paramètre", "Valeur", "Remarque"]],
+    startY: 26,
+    head: [["Parametre", "Valeur", "Remarque"]],
     body: [
-      [
-        "Puissance installée (P_installed)",
-        `${sys.p_installed} kWp`,
-        "Capacité totale du système",
-      ],
+      ["Puissance installee", `${sys.p_installed} kWp`, "P_installed"],
       [
         "Nombre de modules",
         `${sys.n_modules}`,
-        `${sys.module_brand} ${sys.module_model} — ${sys.module_power}Wp`,
+        `${sys.module_brand} ${sys.module_model} ${sys.module_power}Wp`,
       ],
-      ["Nombre d'onduleurs", `${sys.n_inverters}`, sys.inverter_brand],
-      [
-        "Inclinaison des modules",
-        `${sys.tilt}°`,
-        "Angle par rapport à l'horizontale",
-      ],
+      ["Onduleurs", `${sys.n_inverters}`, sys.inverter_brand],
+      ["Inclinaison", `${sys.tilt} deg`, ""],
       ["Orientation", sys.orientation, ""],
       [
-        "Irradiation annuelle (GHI)",
-        `${sys.ghi_annual} kWh/m²/jour`,
-        "Source: NASA POWER / Mesure site",
+        "GHI annuel",
+        `${sys.ghi_annual} kWh/m2/jour`,
+        "NASA POWER / mesure site",
       ],
-      ["Performance Ratio (PR)", `${sys.pr}%`, "IEC 61724-1:2021"],
-      ["Surface toiture utilisée", `${sys.roof_area} m²`, ""],
-      ["CAPEX Total", fmtDa(sys.capex), "Coût d'investissement initial"],
-      ["O&M Annuel", fmtDa(res.om_annual), `${fin.om_rate}% du CAPEX`],
+      ["Performance Ratio PR", `${sys.pr}%`, "IEC 61724-1:2021"],
+      [
+        "Surface toiture nette",
+        `${sys.roof_area} m2`,
+        "Apres facteur d'espacement",
+      ],
+      ["CAPEX total", fmtDA(sys.capex), "Investissement initial"],
+      ["O&M annuel", fmtDA(res.om_annual), `${fin.om_rate}% du CAPEX`],
     ],
     headStyles: {
-      fillColor: [13, 17, 23],
-      textColor: [245, 158, 11],
+      fillColor: NAVY,
+      textColor: CREAM,
       fontStyle: "bold",
       fontSize: 9,
     },
     bodyStyles: { fontSize: 9 },
-    alternateRowStyles: { fillColor: [249, 250, 251] },
+    alternateRowStyles: { fillColor: [254, 252, 232] },
   });
 
-  const afterSys = (doc as any).lastAutoTable.finalY + 6;
+  const y3 = (doc as any).lastAutoTable.finalY + 6;
   autoTable(doc, {
-    startY: afterSys,
-    head: [["Hypothèse Financière", "Valeur", "Justification"]],
+    startY: y3,
+    head: [["Hypothese Financiere", "Valeur", "Justification"]],
     body: [
       [
         "Taux d'actualisation (r)",
         `${fin.r}%`,
-        "Coût du capital — marché algérien",
+        "Cout du capital — marche algerien",
       ],
       [
-        "Taux d'inflation tarifaire (f)",
+        "Inflation tarifaire (f)",
         `${fin.f}%`,
-        "Inflation tarifaire Sonelgaz historique",
+        "Evolution tarif Sonelgaz historique",
+      ],
+      ["Degradation modules (D)", `${fin.D}%/an`, "Garantie constructeur"],
+      [
+        "Economies demande (DS)",
+        fmtDA(fin.DS),
+        "FIXE — Jamais indexe a l'inflation",
       ],
       [
-        "Taux de dégradation modules (D)",
-        `${fin.D}%/an`,
-        "Garantie constructeur Jinko JKM",
-      ],
-      [
-        "Économies demande fixe (DS)",
-        fmtDa(fin.DS),
-        "⚠️ FIXE — Jamais indexé à l'inflation",
-      ],
-      [
-        "Taux de subvention Sc2",
+        "Subvention Scenario 2",
         `${fin.subsidy_rate}%`,
-        "Loi 09-04 / Dispositif APRUE",
+        "Dispositif APRUE / Loi 09-04",
       ],
-      ["Durée de vie système", "25 ans", "Standard IEC / Garantie onduleur"],
+      ["Duree de vie systeme", "25 ans", "Standard IEC / Garantie onduleur"],
     ],
     headStyles: {
-      fillColor: [245, 158, 11],
-      textColor: [13, 17, 23],
+      fillColor: CREAM,
+      textColor: NAVY,
       fontStyle: "bold",
       fontSize: 9,
     },
     bodyStyles: { fontSize: 9 },
-    alternateRowStyles: { fillColor: [255, 253, 235] },
+    alternateRowStyles: { fillColor: [254, 252, 232] },
   });
 
-  // ── PAGE 4: ANALYSE DES FACTURES ──
+  // ── PAGE 4: ANALYSE FACTURES ───────────────────────────────────────────────
   addPage();
-  doc.setFont("helvetica", "bold");
-  doc.setFontSize(13);
-  doc.setTextColor(13, 17, 23);
-  doc.text("Analyse des Factures Sonelgaz", 14, 20);
-  doc.setFillColor(245, 158, 11);
-  doc.rect(14, 22, 60, 0.8, "F");
-
+  hLine(20, "Analyse des Factures Sonelgaz");
   doc.setFont("helvetica", "normal");
   doc.setFontSize(9);
-  doc.setTextColor(80, 80, 80);
+  doc.setTextColor(...GRAY);
   doc.text(
-    `Tarif pondéré calculé T₀ = ${res.t0.toFixed(4)} DA/kWh  (= ${fmt(res.total_da)} DA / ${fmt(res.total_kwh)} kWh)`,
+    `Tarif pondere T0 = ${res.t0.toFixed(4)} DA/kWh  (Total: ${fmt(res.total_da)} DA / ${fmt(res.total_kwh)} kWh)`,
     14,
     30,
   );
-
   autoTable(doc, {
-    startY: 34,
+    startY: 35,
     head: [
       [
         "Mois",
         "HHP (kWh)",
         "HP (kWh)",
-        "Total (kWh)",
-        "Montant (DA)",
+        "Total Cons. (kWh)",
         "Tarif eff. (DA/kWh)",
       ],
     ],
     body: MONTHS_FULL_FR.map((m, i) => {
       const cons = res.monthly_cons[i];
-      const effTariff =
+      const eff =
         cons > 0 && res.total_kwh > 0
           ? (res.total_da / res.total_kwh).toFixed(4)
           : "—";
-      return [m, "—", "—", fmt(cons), "—", effTariff];
+      return [m, "—", "—", fmt(cons), eff];
     }),
-    foot: [
-      [
-        "TOTAL",
-        "—",
-        "—",
-        fmt(res.total_kwh),
-        fmt(res.total_da),
-        res.t0.toFixed(4),
-      ],
-    ],
+    foot: [["TOTAL", "—", "—", fmt(res.total_kwh), res.t0.toFixed(4)]],
     headStyles: {
-      fillColor: [13, 17, 23],
-      textColor: [245, 158, 11],
+      fillColor: NAVY,
+      textColor: CREAM,
       fontStyle: "bold",
       fontSize: 8,
     },
     bodyStyles: { fontSize: 8 },
     footStyles: {
-      fillColor: [245, 158, 11],
-      textColor: [13, 17, 23],
+      fillColor: CREAM,
+      textColor: NAVY,
       fontStyle: "bold",
       fontSize: 8,
     },
-    alternateRowStyles: { fillColor: [249, 250, 251] },
+    alternateRowStyles: { fillColor: [254, 252, 232] },
     columnStyles: {
       1: { halign: "right" },
       2: { halign: "right" },
       3: { halign: "right" },
       4: { halign: "right" },
-      5: { halign: "right" },
     },
   });
 
-  // ── PAGE 5: PRODUCTION ÉNERGÉTIQUE & SCR ──
+  // ── PAGE 5: PRODUCTION & SCR ───────────────────────────────────────────────
   addPage();
-  doc.setFont("helvetica", "bold");
-  doc.setFontSize(13);
-  doc.setTextColor(13, 17, 23);
-  doc.text("Production PV & Autoconsommation (SCR)", 14, 20);
-  doc.setFillColor(245, 158, 11);
-  doc.rect(14, 22, 70, 0.8, "F");
-
+  hLine(20, "Production PV & Autoconsommation (SCR)");
   autoTable(doc, {
-    startY: 27,
+    startY: 26,
     head: [
       [
         "Mois",
@@ -995,19 +943,19 @@ function generatePDF(
       ],
     ],
     headStyles: {
-      fillColor: [13, 17, 23],
-      textColor: [245, 158, 11],
+      fillColor: NAVY,
+      textColor: CREAM,
       fontStyle: "bold",
       fontSize: 8,
     },
     bodyStyles: { fontSize: 8 },
     footStyles: {
-      fillColor: [245, 158, 11],
-      textColor: [13, 17, 23],
+      fillColor: CREAM,
+      textColor: NAVY,
       fontStyle: "bold",
       fontSize: 8,
     },
-    alternateRowStyles: { fillColor: [255, 253, 235] },
+    alternateRowStyles: { fillColor: [254, 252, 232] },
     columnStyles: {
       1: { halign: "right" },
       2: { halign: "right" },
@@ -1017,102 +965,83 @@ function generatePDF(
     },
   });
 
-  // Bar chart: Production vs Consumption
-  const chartY = (doc as any).lastAutoTable.finalY + 6;
-  if (chartY < PH - 60) {
-    const barImg = makeBarChart(
+  const chartY5 = (doc as any).lastAutoTable.finalY + 4;
+  if (chartY5 < PH - 58) {
+    const img = makeBarChart(
       res.monthly_pv,
       res.monthly_cons,
       MONTHS_FR,
-      500,
+      520,
       160,
-      "#f59e0b",
-      "#3b82f6",
-      "Production PV (jaune) vs Consommation (bleu) — kWh/mois",
+      C.cream,
+      C.navy,
+      "Production PV (clair) vs Consommation (fonce) — kWh/mois",
     );
-    doc.addImage(barImg, "PNG", 14, chartY, PW - 28, 45);
-
-    doc.setFontSize(8);
-    doc.setFont("helvetica", "normal");
-    doc.setTextColor(80, 80, 80);
+    doc.addImage(img, "PNG", 14, chartY5, PW - 28, 46);
+    doc.setFontSize(7);
+    doc.setTextColor(...GRAY);
     doc.text(
-      `SCR Annuel Calculé: ${res.scr}% (méthode: Σmin(E_PV,m, E_cons,m) / Σ E_PV,m)`,
+      `SCR annuel calcule: ${res.scr}%  |  Auto-consomme: ${fmt(res.e_self_yr1)} kWh  |  Exporte: ${fmt(res.exported)} kWh`,
       14,
-      chartY + 49,
-    );
-    doc.text(
-      `Énergie autoconsommée: ${fmt(res.e_self_yr1)} kWh/an | Surplus exporté: ${fmt(res.exported)} kWh/an`,
-      14,
-      chartY + 55,
+      chartY5 + 50,
     );
   }
 
-  // ── PAGE 6: RÉSULTATS FINANCIERS ──
+  // ── PAGE 6: RESULTATS FINANCIERS ──────────────────────────────────────────
   addPage();
-  doc.setFont("helvetica", "bold");
-  doc.setFontSize(13);
-  doc.setTextColor(13, 17, 23);
-  doc.text("Résultats Financiers — Scénario 1 (Sans Subvention)", 14, 20);
-  doc.setFillColor(245, 158, 11);
-  doc.rect(14, 22, 90, 0.8, "F");
-
-  doc.setFontSize(9);
+  hLine(20, "Resultats Financiers — Comparaison Sc1 vs Sc2");
   doc.setFont("helvetica", "normal");
-  doc.setTextColor(80, 80, 80);
+  doc.setFontSize(8);
+  doc.setTextColor(...GRAY);
   doc.text(
-    `CAPEX = ${fmtDa(sys.capex)} | r = ${fin.r}% | f = ${fin.f}% | D = ${fin.D}%/an | O&M = ${fin.om_rate}%/an | DS = ${fmtDa(fin.DS)}/an (FIXE)`,
+    `CAPEX=${fmtDA(sys.capex)} | r=${fin.r}% | f=${fin.f}% | D=${fin.D}%/an | O&M=${fin.om_rate}% | DS=${fmtDA(fin.DS)}/an (FIXE)`,
     14,
     28,
   );
 
   autoTable(doc, {
-    startY: 32,
-    head: [
-      ["Indicateur", "Scénario 1", "Scénario 2 (+subv.)", "Δ Amélioration"],
-    ],
+    startY: 33,
+    head: [["Indicateur", "Scenario 1", "Scenario 2 (+subv.)", "Delta"]],
     body: [
       [
         "Investissement Net",
-        fmtDa(sys.capex),
-        fmtDa(res.capex_sc2),
-        `−${fmtDa(sys.capex - res.capex_sc2)}`,
+        fmtDA(sys.capex),
+        fmtDA(res.capex_sc2),
+        `-${fmtDA(sys.capex - res.capex_sc2)}`,
       ],
       [
-        "Économies Brutes An 1",
-        fmtDa(res.yr1_gross_savings),
-        fmtDa(res.yr1_gross_savings),
+        "Economies Brutes An 1",
+        fmtDA(res.yr1_gross_savings),
+        fmtDA(res.yr1_gross_savings),
         "—",
       ],
       [
-        "  dont économies énergie",
-        fmtDa(res.yr1_energy_savings),
-        fmtDa(res.yr1_energy_savings),
+        "  dont eco. energie",
+        fmtDA(res.yr1_energy_savings),
+        fmtDA(res.yr1_energy_savings),
         "—",
       ],
-      [
-        "  dont économies demande (DS)",
-        fmtDa(fin.DS),
-        fmtDa(fin.DS),
-        "— (FIXE)",
-      ],
-      ["Flux Net An 1", fmtDa(res.yr1_net_cf), fmtDa(res.yr1_net_cf), "—"],
+      ["  dont eco. demande (DS FIXE)", fmtDA(fin.DS), fmtDA(fin.DS), "—"],
+      ["Flux Net An 1", fmtDA(res.yr1_net_cf), fmtDA(res.yr1_net_cf), "—"],
       [
         "DRS (Simple Payback)",
         `${res.spp_sc1} ans`,
         `${res.spp_sc2} ans`,
-        `−${(res.spp_sc1 - res.spp_sc2).toFixed(1)} ans`,
+        `-${(res.spp_sc1 - res.spp_sc2).toFixed(1)} ans`,
       ],
       [
-        "DRA (Actualisé)",
+        "DRA (Actualise)",
         `${res.dpp_sc1 ?? ">25"} ans`,
         `${res.dpp_sc2 ?? ">25"} ans`,
-        res.dpp_sc1 && res.dpp_sc2 ? `−${res.dpp_sc1 - res.dpp_sc2} ans` : "—",
+        res.dpp_sc1 !== null && res.dpp_sc2 !== null
+          ? `-${res.dpp_sc1 - res.dpp_sc2} ans`
+          : "—",
       ],
       [
         "VAN (25 ans, r=6%)",
-        fmtDa(res.npv_sc1),
-        fmtDa(res.npv_sc2),
-        `+${fmtDa(res.npv_sc2 - res.npv_sc1)}`,
+        fmtDA(res.npv_sc1),
+        fmtDA(res.npv_sc2),
+        `+${fmtDA(res.npv_sc2 - res.npv_sc1)}`,
       ],
       [
         "TRI",
@@ -1121,7 +1050,7 @@ function generatePDF(
         `+${(res.irr_sc2 - res.irr_sc1).toFixed(2)}%`,
       ],
       [
-        "IP (Indice Profitabilité)",
+        "IP (Indice Profitabilite)",
         res.pi_sc1.toFixed(3),
         res.pi_sc2.toFixed(3),
         `+${(res.pi_sc2 - res.pi_sc1).toFixed(3)}`,
@@ -1129,13 +1058,13 @@ function generatePDF(
       ["LCOE", `${res.lcoe} DA/kWh`, `${res.lcoe} DA/kWh`, "—"],
     ],
     headStyles: {
-      fillColor: [13, 17, 23],
-      textColor: [245, 158, 11],
+      fillColor: NAVY,
+      textColor: CREAM,
       fontStyle: "bold",
       fontSize: 9,
     },
     bodyStyles: { fontSize: 9 },
-    alternateRowStyles: { fillColor: [249, 250, 251] },
+    alternateRowStyles: { fillColor: [254, 252, 232] },
     columnStyles: {
       1: { halign: "right" },
       2: { halign: "right" },
@@ -1143,62 +1072,56 @@ function generatePDF(
     },
   });
 
-  // ── PAGE 7: TABLE DCF 25 ANS ──
+  // ── PAGE 7: DCF TABLE ─────────────────────────────────────────────────────
   addPage();
-  doc.setFont("helvetica", "bold");
-  doc.setFontSize(13);
-  doc.setTextColor(13, 17, 23);
-  doc.text("Tableau de Flux de Trésorerie Actualisés — 25 ans", 14, 20);
-  doc.setFillColor(245, 158, 11);
-  doc.rect(14, 22, 80, 0.8, "F");
-
-  doc.setFontSize(7.5);
+  hLine(20, "Tableau DCF — 25 ans");
   doc.setFont("helvetica", "normal");
-  doc.setTextColor(80, 80, 80);
+  doc.setFontSize(7.5);
+  doc.setTextColor(...GRAY);
   doc.text(
-    "DS = Économies demande FIXES (non indexées) | T_n = T₀×(1+f)^(n-1) | DCF = CF/(1+r)^n",
+    "DS = FIXE (non indexe) | T_n = T0*(1+f)^(n-1) | DCF = CF/(1+r)^n | Vert = annee de rentabilite",
     14,
     28,
   );
 
   autoTable(doc, {
-    startY: 32,
+    startY: 33,
     head: [
       [
         "An",
-        "E_self (kWh)",
-        "T_n (DA/kWh)",
-        "Éc.Énergie (DA)",
-        "DS (DA)",
-        "Brut (DA)",
-        "O&M (DA)",
-        "Net CF (DA)",
-        "DCF (DA)",
-        "ΣVA Sc1 (DA)",
-        "ΣVA Sc2 (DA)",
+        "E_self",
+        "T_n",
+        "Eco.Energ",
+        "DS",
+        "Brut",
+        "O&M",
+        "Net CF",
+        "DCF",
+        "VA Sc1",
+        "VA Sc2",
       ],
     ],
-    body: res.dcf_table.map((r) => [
-      r.year,
-      fmt(r.e_self_n),
-      r.t_n.toFixed(4),
-      fmt(r.energy_savings),
-      fmt(r.ds),
-      fmt(r.gross_savings),
-      fmt(r.om),
-      fmt(r.net_cf),
-      fmt(r.dcf),
-      fmt(r.cum_sc1),
-      fmt(r.cum_sc2),
+    body: res.dcf_table.map((row) => [
+      row.year,
+      fmt(row.e_self_n),
+      row.t_n.toFixed(4),
+      fmt(row.energy_savings),
+      fmt(row.ds),
+      fmt(row.gross_savings),
+      fmt(row.om),
+      fmt(row.net_cf),
+      fmt(row.dcf),
+      fmt(row.cum_sc1),
+      fmt(row.cum_sc2),
     ]),
     headStyles: {
-      fillColor: [13, 17, 23],
-      textColor: [245, 158, 11],
+      fillColor: NAVY,
+      textColor: CREAM,
       fontStyle: "bold",
       fontSize: 6.5,
     },
     bodyStyles: { fontSize: 7 },
-    alternateRowStyles: { fillColor: [249, 250, 251] },
+    alternateRowStyles: { fillColor: [254, 252, 232] },
     columnStyles: {
       0: { halign: "center", cellWidth: 7 },
       1: { halign: "right" },
@@ -1213,117 +1136,97 @@ function generatePDF(
       10: { halign: "right" },
     },
     didParseCell: (data) => {
-      if (data.section === "body") {
-        const row = res.dcf_table[data.row.index];
-        if (row?.cum_sc1 >= 0 && data.column.index === 9) {
-          data.cell.styles.textColor = [34, 197, 94];
-          data.cell.styles.fontStyle = "bold";
-        }
-        if (row?.cum_sc2 >= 0 && data.column.index === 10) {
-          data.cell.styles.textColor = [59, 130, 246];
-          data.cell.styles.fontStyle = "bold";
-        }
+      if (data.section !== "body") return;
+      const row = res.dcf_table[data.row.index];
+      if (!row) return;
+      if (row.cum_sc1 >= 0 && data.column.index === 9) {
+        data.cell.styles.textColor = [22, 163, 74];
+        data.cell.styles.fontStyle = "bold";
+      }
+      if (row.cum_sc2 >= 0 && data.column.index === 10) {
+        data.cell.styles.textColor = [37, 99, 235];
+        data.cell.styles.fontStyle = "bold";
       }
     },
   });
 
-  // ── PAGE 8: GRAPHIQUE VAN CUMULÉE ──
+  // ── PAGE 8: COURBE VAN + SCR ──────────────────────────────────────────────
   addPage();
-  doc.setFont("helvetica", "bold");
-  doc.setFontSize(13);
-  doc.setTextColor(13, 17, 23);
-  doc.text("Évolution de la VAN Cumulée — 25 ans", 14, 20);
-  doc.setFillColor(245, 158, 11);
-  doc.rect(14, 22, 65, 0.8, "F");
+  hLine(20, "Evolution VAN Cumulee — 25 ans");
 
-  const npvCurve1 = res.dcf_table.map((r) => r.cum_sc1);
-  const npvCurve2 = res.dcf_table.map((r) => r.cum_sc2);
-  const yearLabels = res.dcf_table.map((r) => String(r.year));
-
-  const lineImg = makeLineChart(npvCurve1, npvCurve2, yearLabels, 520, 220);
+  const npv1 = res.dcf_table.map((r) => r.cum_sc1);
+  const npv2 = res.dcf_table.map((r) => r.cum_sc2);
+  const yrLbls = res.dcf_table.map((r) => String(r.year));
+  const lineImg = makeLineChart(npv1, npv2, yrLbls, 520, 220);
   doc.addImage(lineImg, "PNG", 14, 27, PW - 28, 65);
 
   doc.setFontSize(8);
   doc.setFont("helvetica", "normal");
-  doc.setTextColor(80, 80, 80);
+  doc.setTextColor(...GRAY);
   doc.text(
-    `Sc1 (sans subv.): VAN finale = ${fmtDa(res.npv_sc1)} | TRI = ${res.irr_sc1}% | DRA = ${res.dpp_sc1 ?? ">25"} ans`,
+    `Sc1: VAN=${fmtDA(res.npv_sc1)} | TRI=${res.irr_sc1}% | DRA=${res.dpp_sc1 ?? ">25"} ans`,
     14,
     96,
   );
   doc.text(
-    `Sc2 (avec subv.): VAN finale = ${fmtDa(res.npv_sc2)} | TRI = ${res.irr_sc2}% | DRA = ${res.dpp_sc2 ?? ">25"} ans`,
+    `Sc2: VAN=${fmtDA(res.npv_sc2)} | TRI=${res.irr_sc2}% | DRA=${res.dpp_sc2 ?? ">25"} ans`,
     14,
     102,
   );
 
-  // Production chart for second half of page
-  const scImg = makeBarChart(
+  const scrImg = makeBarChart(
     res.monthly_scr,
     null,
     MONTHS_FR,
-    500,
+    520,
     140,
-    "#f59e0b",
-    "#3b82f6",
-    "Taux d'Autoconsommation Mensuel (SCR%) — methode: min(E_PV,m, E_cons,m) / E_PV,m",
+    C.cream,
+    C.navy,
+    "Taux d'Autoconsommation Mensuel SCR% — methode: min(E_PV,m, E_cons,m) / E_PV,m",
   );
-  doc.addImage(scImg, "PNG", 14, 108, PW - 28, 42);
+  doc.addImage(scrImg, "PNG", 14, 108, PW - 28, 42);
 
-  // ── PAGE 9: IMPACT ENVIRONNEMENTAL & RECOMMANDATIONS ──
+  // ── PAGE 9: ENVIRONNEMENT & RECOMMANDATIONS ───────────────────────────────
   addPage();
-  doc.setFont("helvetica", "bold");
-  doc.setFontSize(13);
-  doc.setTextColor(13, 17, 23);
-  doc.text("Impact Environnemental & Comptage Net", 14, 20);
-  doc.setFillColor(34, 197, 94);
-  doc.rect(14, 22, 65, 0.8, "F");
-
+  hLine(20, "Impact Environnemental & Comptage Net");
   autoTable(doc, {
-    startY: 27,
-    head: [
-      [
-        "Indicateur Environnemental",
-        "Valeur Année 1",
-        "Valeur 25 ans",
-        "Équivalent",
-      ],
-    ],
+    startY: 26,
+    head: [["Indicateur", "Valeur An 1", "Valeur 25 ans", "Reference"]],
     body: [
       [
-        "CO₂ évité",
-        `${res.co2_yr1} tCO₂/an`,
-        `${res.co2_25yr} tCO₂`,
-        `Facteur: 0.550 kg CO₂/kWh`,
+        "CO2 evite",
+        `${res.co2_yr1} tCO2`,
+        `${res.co2_25yr} tCO2`,
+        "Facteur 0.550 kg CO2/kWh — reseau algerien",
       ],
       [
-        "Arbres équivalents (séquestration)",
-        `${res.trees_equiv} arbres`,
-        `${res.trees_equiv * 25} arbres`,
-        "45 arbres/tCO₂/an",
+        "Arbres equivalents",
+        `${res.trees_equiv}`,
+        `${res.trees_equiv * 25}`,
+        "45 arbres / tCO2 / an",
       ],
       [
-        "Véhicules retirés équivalent",
-        `${res.vehicles_equiv} véhicules`,
+        "Vehicules retires equiv.",
+        `${res.vehicles_equiv}`,
         "—",
-        "2.3 tCO₂/véhicule/an",
+        "2.3 tCO2 / vehicule / an",
       ],
       [
-        "Surplus exporté (comptage net)",
+        "Surplus exporte (net. net)",
         `${fmt(res.exported)} kWh`,
         "—",
-        `Loi 04-09 sur les énergies renouvelables`,
+        "Loi 04-09 sur les energies renouvelables",
       ],
       [
-        "Revenus comptage net potentiels",
-        fmtDa(res.nm_revenue),
+        "Revenus comptage net",
+        fmtDA(res.nm_revenue),
         "—",
-        `${res.exported.toLocaleString()} kWh × 1.8064 DA/kWh`,
+        `${fmt(res.exported)} kWh * 1.8064 DA/kWh`,
       ],
     ],
     headStyles: {
-      fillColor: [13, 17, 23],
-      textColor: [34, 197, 94],
+      fillColor: [22, 101, 52],
+      textColor: [187, 247, 208],
       fontStyle: "bold",
       fontSize: 9,
     },
@@ -1331,50 +1234,55 @@ function generatePDF(
     alternateRowStyles: { fillColor: [240, 253, 244] },
   });
 
-  const afterEnv = (doc as any).lastAutoTable.finalY + 8;
+  const recY0 = (doc as any).lastAutoTable.finalY + 8;
   doc.setFont("helvetica", "bold");
   doc.setFontSize(12);
-  doc.setTextColor(13, 17, 23);
-  doc.text("Recommandations", 14, afterEnv);
-  doc.setFillColor(245, 158, 11);
-  doc.rect(14, afterEnv + 2, 40, 0.7, "F");
+  doc.setTextColor(...NAVY);
+  doc.text("Recommandations", 14, recY0);
+  doc.setFillColor(...CREAM);
+  doc.rect(14, recY0 + 1.5, 45, 0.7, "F");
 
   const recs = [
-    `La VAN positive de ${fmtDa(res.npv_sc1)} (Sc1) et ${fmtDa(res.npv_sc2)} (Sc2) confirme la viabilité économique du projet. Investissement recommandé.`,
-    `Avec un TRI de ${res.irr_sc1}% (Sc1), le projet dépasse le taux d'actualisation de ${fin.r}% — création de valeur nette assurée.`,
-    `Le SCR calculé de ${res.scr}% (vs. 70% assumé généralement) valide la pertinence de la méthodologie mensuelle. Maximiser l'autoconsommation en planifiant les usages énergivores en journée.`,
-    `Activer le dispositif de subvention APRUE (Sc2) réduit le DRS de ${(res.spp_sc1 - res.spp_sc2).toFixed(1)} ans et augmente la VAN de ${fmtDa(res.npv_sc2 - res.npv_sc1)}.`,
-    `Un système de monitoring (SCADA/IoT) est recommandé pour valider la production réelle et détecter toute dégradation des performances.`,
-    `Enregistrement au mécanisme de comptage net (Loi 04-09) permettrait de valoriser les ${fmt(res.exported)} kWh/an surplus pour ${fmtDa(res.nm_revenue)}/an additionnels.`,
+    `VAN positive ${fmtDA(res.npv_sc1)} (Sc1) — le projet cree de la valeur sur 25 ans. Investissement recommande.`,
+    `TRI ${res.irr_sc1}% > taux d'actualisation ${fin.r}% — la rentabilite est assuree.`,
+    `SCR calcule ${res.scr}% (vs 70% suppose generallement) — methodologie mensuelle plus precise.`,
+    `Activer le dispositif APRUE (Sc2) reduit le DRS de ${(res.spp_sc1 - res.spp_sc2).toFixed(1)} ans et augmente la VAN de ${fmtDA(res.npv_sc2 - res.npv_sc1)}.`,
+    `Installer un systeme de monitoring (SCADA / IoT) pour valider la production et detecter les degradations.`,
+    `S'enregistrer au mecanisme de comptage net (Loi 04-09) pour valoriser les ${fmt(res.exported)} kWh/an exportes.`,
   ];
 
-  let recY = afterEnv + 8;
+  let ry = recY0 + 9;
   doc.setFont("helvetica", "normal");
   doc.setFontSize(8.5);
   doc.setTextColor(40, 40, 40);
   recs.forEach((rec, i) => {
     doc.setFont("helvetica", "bold");
-    doc.setTextColor(245, 158, 11);
-    doc.text(`${i + 1}.`, 14, recY);
+    doc.setTextColor(...(CREAM[0] > 200 ? NAVY : CREAM));
+    doc.setTextColor(180, 150, 10);
+    doc.text(`${i + 1}.`, 14, ry);
     doc.setFont("helvetica", "normal");
     doc.setTextColor(40, 40, 40);
-    const lines = doc.splitTextToSize(rec, PW - 32);
-    doc.text(lines, 20, recY);
-    recY += lines.length * 5 + 3;
+    const lines = doc.splitTextToSize(rec, PW - 32) as string[];
+    doc.text(lines, 20, ry);
+    ry += lines.length * 5 + 3;
+    if (ry > PH - 20) {
+      addPage();
+      ry = 20;
+    }
   });
 
-  // Footer on all pages
-  const totalPages = doc.getNumberOfPages();
-  for (let p = 1; p <= totalPages; p++) {
+  // ── Footer on every page ─────────────────────────────────────────────────
+  const total = doc.getNumberOfPages();
+  for (let p = 1; p <= total; p++) {
     doc.setPage(p);
     doc.setFontSize(7);
-    doc.setTextColor(150, 150, 150);
+    doc.setTextColor(140, 140, 140);
     doc.text(
-      `SolarAnalytics.dz | Moteur v1.0 | IEC 61724-1:2021 | Biskra 2025-2026`,
+      "SolarAnalytics.dz | Moteur v1.0 | IEC 61724-1:2021 | Universite de Biskra 2025-2026",
       14,
-      PH - 6,
+      PH - 5,
     );
-    doc.text(`Page ${p} / ${totalPages}`, PW - 14, PH - 6, { align: "right" });
+    doc.text(`Page ${p} / ${total}`, PW - 14, PH - 5, { align: "right" });
   }
 
   doc.save(
@@ -1382,140 +1290,197 @@ function generatePDF(
   );
 }
 
-// ─── Default Values ───────────────────────────────────────────────────────────
-const DEFAULT_SYS: SystemParams = {
-  building_name: "Faculté des Sciences et Technologies",
-  building_address: "Université de Biskra, Biskra, Algérie",
-  p_installed: 285.13,
-  ghi_annual: 5.5,
-  pr: 80,
-  capex: 24408342,
-  n_modules: 770,
-  module_brand: "Jinko Solar",
-  module_model: "JKM370M-72",
-  module_power: 370,
-  inverter_brand: "5 onduleurs (config. 55 strings × 14 modules)",
-  n_inverters: 5,
-  tilt: 30,
-  orientation: "Sud",
-  roof_area: 2145.99,
-};
+// ─── Sonelgaz bill parser (Tarif HTA 42 — based on actual Sonelgaz bill structure) ──
+// Fields to extract from each Sonelgaz HTA Tarif 42 bill:
+//   hp_kwh   = Heures Hors Pointe = Cadran 1 + Cadran 2   (tariff ~1.80 DA/kWh)
+//   peak_kwh = Heures de Pointe   = Cadran 3               (tariff ~8.72 DA/kWh)
+//   total_da = TOTAL FACTURE / Net a Payer
+//   month, year from billing period header
+function parseSonelgazBill(
+  text: string,
+  slotIdx: number,
+): { data: BillData; warn: string } {
+  // 1 — Normalise
+  //   a) collapse whitespace within lines
+  //   b) remove French thousands separators: "10 322" → "10322"
+  //      Must run twice because "1 234 567" needs two passes
+  let t = text.replace(/\r\n/g, "\n").replace(/[ \t]+/g, " ");
+  t = t.replace(/(\d) (\d{3})(?=[ ,.\n]|$)/g, "$1$2");
+  t = t.replace(/(\d) (\d{3})(?=[ ,.\n]|$)/g, "$1$2");
+  // c) comma-decimal → dot-decimal: "10322,00" → "10322.00"
+  t = t.replace(/(\d),(\d{2})(?!\d)/g, "$1.$2");
 
-const DEFAULT_FIN: FinancialParams = {
-  r: 6,
-  f: 4,
-  D: 0.5,
-  om_rate: 1,
-  DS: 120000,
-  subsidy_rate: 20,
-};
+  const lines = t
+    .split("\n")
+    .map((l) => l.trim())
+    .filter((l) => l.length > 0);
 
-// ─── Sonelgaz Bill Parser ─────────────────────────────────────────────────────
-// Parses raw Tesseract text from a Sonelgaz electricity bill.
-// Sonelgaz HTA/BT bills have these fields we care about:
-//   • Heures Hors Pointe (HHP) — off-peak kWh  → hp_kwh
-//   • Heures de Pointe   (HP)  — peak kWh       → peak_kwh
-//   • Net à Payer / Montant Total               → total_da
-//   • Billing period (month + year)
-//
-// Because Tesseract OCR output varies with image quality, we apply
-// multiple fallback strategies for each field.
-function parseSonelgazBill(text: string, slotIdx: number): BillData {
-  // Normalise: collapse whitespace, remove thousands separators (space or dot before 3 digits)
-  const t = text
-    .replace(/\r\n/g, "\n")
-    .replace(/[ \t]+/g, " ")
-    .replace(/(\d)[ .](\d{3})(?!\d)/g, "$1$2"); // "12 345" → "12345"
+  // ── Helpers ──
+  const toNum = (s: string): number => {
+    const v = parseFloat(s.replace(/\s/g, "").replace(",", "."));
+    return isNaN(v) ? 0 : v;
+  };
+  const numsIn = (s: string): number[] =>
+    [...s.matchAll(/\d+(?:\.\d{1,2})?/g)].map((m) => toNum(m[0]));
 
-  // ── Helper: extract first number that appears after a keyword ──
-  const after = (keywords: string[], src = t): number => {
+  const findAfter = (src: string, keywords: RegExp[]): number => {
     for (const kw of keywords) {
-      // case-insensitive search for keyword then first integer/decimal nearby
-      const re = new RegExp(
-        kw + "[^\\d]{0,30}(\\d{1,7}(?:[.,]\\d{1,2})?)",
-        "i",
-      );
-      const m = src.match(re);
-      if (m) return parseFloat(m[1].replace(",", "."));
+      const m = src.match(kw);
+      if (m && m[1]) {
+        const v = toNum(m[1]);
+        if (v > 0) return v;
+      }
     }
     return 0;
   };
 
-  // ── Helper: extract number that appears BEFORE a keyword (for totals) ──
-  const before = (keywords: string[], src = t): number => {
-    for (const kw of keywords) {
-      const re = new RegExp(
-        "(\\d{3,9}(?:[.,]\\d{1,2})?)\\s*(?:DA|DZD)?[^\\d]{0,20}" + kw,
-        "i",
-      );
-      const m = src.match(re);
-      if (m) return parseFloat(m[1].replace(",", "."));
-    }
-    return 0;
-  };
+  // ── Strategy 1: Cadran-based (most precise for HTA) ─────────────────────
+  // The bill has a table header row "Cadran 1 / Cadran 2 / Cadran 3"
+  // followed on the next row by the consumption quantities.
+  let c1 = 0,
+    c2 = 0,
+    c3 = 0;
 
-  // ── HHP — off-peak consumption ──
-  // Sonelgaz labels: "Heures Hors Pointe", "H.H.P", "HHP", "Hors Pointe", "Cadran 1", "Cadran 2"
-  let hp_kwh = after([
-    "Heures\\s+Hors\\s+Pointe",
-    "H\\.H\\.P\\.?",
-    "HHP",
-    "Hors\\s+Pointe",
-    "Cadran\\s*1",
-    "Cadran\\s*2",
-    "C1",
-    "C2",
+  // Try inline on same line: "Cadran 1   10322.00"
+  c1 = findAfter(t, [
+    /[Cc]adran\s*1[^\d\n]{0,60}(\d{3,6}(?:\.\d{1,2})?)/,
+    /\bC1\b[^\d\n]{0,30}(\d{3,6}(?:\.\d{1,2})?)/,
+  ]);
+  c2 = findAfter(t, [
+    /[Cc]adran\s*2[^\d\n]{0,60}(\d{3,6}(?:\.\d{1,2})?)/,
+    /\bC2\b[^\d\n]{0,30}(\d{3,6}(?:\.\d{1,2})?)/,
+  ]);
+  c3 = findAfter(t, [
+    /[Cc]adran\s*3[^\d\n]{0,60}(\d{3,6}(?:\.\d{1,2})?)/,
+    /\bC3\b[^\d\n]{0,30}(\d{3,6}(?:\.\d{1,2})?)/,
   ]);
 
-  // ── HP — peak consumption ──
-  // Sonelgaz labels: "Heures de Pointe", "H\\.P\\.?", "HP", "Cadran 3", "C3"
-  let peak_kwh = after([
-    "Heures\\s+de\\s+Pointe",
-    "H\\.P\\.?(?!\\s*P)",
-    "\\bHP\\b",
-    "Cadran\\s*3",
-    "C3",
-  ]);
-
-  // ── Fallback: if both are 0, try to grab the two largest reasonable numbers ──
-  // (Sonelgaz bills typically show consumption figures prominently)
-  if (hp_kwh === 0 && peak_kwh === 0) {
-    const allNums = [...t.matchAll(/\b(\d{3,6})\b/g)]
-      .map((m) => parseInt(m[1]))
-      .filter((n) => n >= 100 && n <= 99999) // plausible kWh range
-      .sort((a, b) => b - a);
-    if (allNums.length >= 2) {
-      hp_kwh = allNums[0];
-      peak_kwh = allNums[1];
-    } else if (allNums.length === 1) {
-      hp_kwh = allNums[0];
+  // If not inline — Cadran headers are a row by themselves, values on next row
+  if (c1 === 0 && c2 === 0) {
+    for (let i = 0; i < lines.length - 1; i++) {
+      const lo = lines[i].toLowerCase();
+      if (lo.includes("cadran") && lo.includes("1")) {
+        // next line should have the quantities
+        const nxt = lines[i + 1];
+        const nums = numsIn(nxt).filter((n) => n >= 50 && n <= 999999);
+        if (nums.length >= 3) {
+          c1 = nums[0];
+          c2 = nums[1];
+          c3 = nums[2];
+        } else if (nums.length === 2) {
+          c1 = nums[0];
+          c2 = nums[1];
+        } else if (nums.length === 1) {
+          c1 = nums[0];
+        }
+        break;
+      }
     }
   }
 
-  // ── Total DA ──
-  // Sonelgaz labels: "Net à Payer", "Montant Net", "Total TTC", "Total à Payer", "NET A PAYER"
-  let total_da = after([
-    "Net\\s+[àa]\\s+Payer",
-    "Montant\\s+Net",
-    "Total\\s+TTC",
-    "Total\\s+[àa]\\s+Payer",
-    "NET\\s+A\\s+PAYER",
-    "Montant\\s+Total",
-  ]);
-  if (!total_da) {
-    total_da = before(["Net\\s+[àa]\\s+Payer", "Montant\\s+Net", "TTC", "DA"]);
+  // ── Strategy 2: Periodes Tarifaires ─────────────────────────────────────
+  // The bill shows "H Pointe" and "Pointe" column headers with values below.
+  let hpPeriode = 0,
+    pPeriode = 0;
+
+  // Try same-line pattern: "H.Pointe  33721.49   Pointe  320.71"
+  const periodeLineRe =
+    /H[.\s]*Pointe.*?(\d{3,6}(?:\.\d{1,2})?).*?Pointe.*?(\d{2,5}(?:\.\d{1,2})?)/i;
+  const plMatch = t.match(periodeLineRe);
+  if (plMatch) {
+    hpPeriode = toNum(plMatch[1]);
+    pPeriode = toNum(plMatch[2]);
   }
-  // Last-resort: largest number in the bill that looks like a DA amount (>1000)
-  if (!total_da) {
-    const big = [...t.matchAll(/\b(\d{4,9})\b/g)]
-      .map((m) => parseInt(m[1]))
-      .filter((n) => n > 1000)
+
+  if (hpPeriode === 0) {
+    hpPeriode = findAfter(t, [
+      /H(?:eures?\s+)?(?:H(?:ors)?\s+)?Pointe[^\d\n]{0,30}(\d{3,6}(?:\.\d{1,2})?)/i,
+      /HHP[^\d\n]{0,20}(\d{3,6}(?:\.\d{1,2})?)/i,
+    ]);
+  }
+
+  // ── Determine hp_kwh and peak_kwh ────────────────────────────────────────
+  let hp_kwh = 0,
+    peak_kwh = 0;
+
+  if (c1 > 0 || c2 > 0 || c3 > 0) {
+    // HTA Tarif 42: Cadran 1 + 2 = HHP, Cadran 3 = HP (peak)
+    hp_kwh = c1 + c2;
+    peak_kwh = c3;
+    // Edge: only c3 was found — put it in hp
+    if (hp_kwh === 0 && peak_kwh > 0) {
+      hp_kwh = peak_kwh;
+      peak_kwh = 0;
+    }
+  } else if (hpPeriode > 0 || pPeriode > 0) {
+    hp_kwh = hpPeriode;
+    peak_kwh = pPeriode;
+  } else {
+    // Last resort: pick the 2 most prominent kWh-range numbers
+    const all = lines.flatMap((l) =>
+      numsIn(l).filter((n) => n >= 100 && n <= 99999),
+    );
+    const uniq = [...new Set(all)].sort((a, b) => b - a);
+    if (uniq.length >= 2) {
+      hp_kwh = uniq[0];
+      peak_kwh = uniq[1];
+    } else if (uniq.length === 1) {
+      hp_kwh = uniq[0];
+    }
+  }
+
+  // ── Total DA ─────────────────────────────────────────────────────────────
+  let total_da = 0;
+
+  // Look for "TOTAL FACTURE" / "Net a Payer" and take the number on same or next line
+  const totalKeywords = [
+    /TOTAL\s*FACTURE[^\d\n]{0,20}(\d{4,9}(?:\.\d{1,2})?)/i,
+    /Net\s+[àa]\s+Payer[^\d\n]{0,20}(\d{4,9}(?:\.\d{1,2})?)/i,
+    /Montant\s+Net[^\d\n]{0,20}(\d{4,9}(?:\.\d{1,2})?)/i,
+    /Total\s+TTC[^\d\n]{0,20}(\d{4,9}(?:\.\d{1,2})?)/i,
+    /NET\s+A\s+PAYER[^\d\n]{0,20}(\d{4,9}(?:\.\d{1,2})?)/i,
+  ];
+
+  total_da = findAfter(t, totalKeywords);
+
+  // If not found inline, check line-by-line (value may be on next line)
+  if (total_da === 0) {
+    for (let i = 0; i < lines.length; i++) {
+      const lo = lines[i].toLowerCase();
+      const isTotal =
+        (lo.includes("total") && lo.includes("facture")) ||
+        lo.includes("net a payer") ||
+        (lo.includes("montant") && lo.includes("net"));
+      if (isTotal) {
+        // Try numbers on same line
+        const sameNums = numsIn(lines[i]).filter((n) => n > 1000);
+        if (sameNums.length) {
+          total_da = sameNums[sameNums.length - 1];
+          break;
+        }
+        // Try next line
+        if (i + 1 < lines.length) {
+          const nextNums = numsIn(lines[i + 1]).filter((n) => n > 1000);
+          if (nextNums.length) {
+            total_da = nextNums[0];
+            break;
+          }
+        }
+      }
+    }
+  }
+
+  // Absolute fallback: largest number > 5000 likely to be a DA bill amount
+  if (total_da === 0) {
+    const big = lines
+      .flatMap((l) => numsIn(l))
+      .filter((n) => n > 5000 && n < 5_000_000)
       .sort((a, b) => b - a);
     if (big.length) total_da = big[0];
   }
 
-  // ── Month & Year ──
-  const MONTH_NAMES: Record<string, number> = {
+  // ── Month & Year ─────────────────────────────────────────────────────────
+  const MONTH_MAP: Record<string, number> = {
     janvier: 1,
     fevrier: 2,
     février: 2,
@@ -1524,13 +1489,13 @@ function parseSonelgazBill(text: string, slotIdx: number): BillData {
     mai: 5,
     juin: 6,
     juillet: 7,
-    août: 8,
     aout: 8,
+    août: 8,
     septembre: 9,
     octobre: 10,
     novembre: 11,
-    décembre: 12,
     decembre: 12,
+    décembre: 12,
     jan: 1,
     fev: 2,
     fév: 2,
@@ -1538,7 +1503,6 @@ function parseSonelgazBill(text: string, slotIdx: number): BillData {
     avr: 4,
     jun: 6,
     jul: 7,
-    aou: 8,
     sep: 9,
     oct: 10,
     nov: 11,
@@ -1546,52 +1510,84 @@ function parseSonelgazBill(text: string, slotIdx: number): BillData {
     déc: 12,
   };
 
-  let month = slotIdx + 1; // default: use slot position (Jan=1 … Dec=12)
+  let month = slotIdx + 1; // default = slot index (Jan=1 … Dec=12)
   let year = new Date().getFullYear();
 
-  // Try "Mois: Janvier 2024" or "Période: 01/2024"
-  const monthNameRe = new RegExp(
-    "(?:p[ée]riode|mois|du|facturation)[^\\w]{0,15}(" +
-      Object.keys(MONTH_NAMES).join("|") +
-      ")[^\\d]{0,10}(\\d{4})?",
-    "i",
-  );
-  const mnMatch = t.match(monthNameRe);
-  if (mnMatch) {
-    month = MONTH_NAMES[mnMatch[1].toLowerCase()] ?? month;
-    if (mnMatch[2]) year = parseInt(mnMatch[2]);
+  // Pattern 1: "Janvier 2023" anywhere in text
+  const mkeys = Object.keys(MONTH_MAP).join("|");
+  const mRe = new RegExp(`\\b(${mkeys})\\b[\\s,.-]{0,5}(20\\d{2})`, "i");
+  const mMatch = t.match(mRe);
+  if (mMatch) {
+    month = MONTH_MAP[mMatch[1].toLowerCase()] ?? month;
+    year = parseInt(mMatch[2]);
   }
 
-  // Try MM/YYYY or MM-YYYY patterns
-  if (!mnMatch) {
-    const numDateRe = /\b(0?[1-9]|1[0-2])[\/\-](20\d{2})\b/;
-    const nd = t.match(numDateRe);
-    if (nd) {
-      month = parseInt(nd[1]);
-      year = parseInt(nd[2]);
+  // Pattern 2: MM/YYYY or MM-YYYY
+  if (!mMatch) {
+    const numRe = /\b(0?[1-9]|1[0-2])[\/\-](20\d{2})\b/;
+    const nMatch = t.match(numRe);
+    if (nMatch) {
+      month = parseInt(nMatch[1]);
+      year = parseInt(nMatch[2]);
     }
   }
 
-  // Try standalone 4-digit year anywhere
-  const yearMatch = t.match(/\b(202[0-9])\b/);
-  if (yearMatch && year === new Date().getFullYear())
-    year = parseInt(yearMatch[1]);
+  // Pattern 3: standalone year
+  const yMatch = t.match(/\b(202\d)\b/);
+  if (yMatch && year === new Date().getFullYear()) year = parseInt(yMatch[1]);
+
+  // ── Build warning string for partial extractions ─────────────────────────
+  const warns: string[] = [];
+  if (hp_kwh === 0 && peak_kwh === 0) warns.push("Consommation non detectee");
+  if (total_da === 0) warns.push("Montant non detecte");
+  if (!mMatch) warns.push("Mois/annee non detectes — verifiez");
+  const warn = warns.join(" | ");
 
   return {
-    hp_kwh: Math.round(hp_kwh),
-    peak_kwh: Math.round(peak_kwh),
-    total_da: Math.round(total_da),
-    month,
-    year,
+    data: {
+      hp_kwh: Math.round(hp_kwh),
+      peak_kwh: Math.round(peak_kwh),
+      total_da: Math.round(total_da),
+      month,
+      year,
+    },
+    warn,
   };
 }
 
+// ─── Defaults ─────────────────────────────────────────────────────────────────
+const DEFAULT_SYS: SystemParams = {
+  building_name: "Faculte des Sciences et Technologies",
+  building_address: "Universite de Biskra, Biskra, Algerie",
+  p_installed: 285.13,
+  ghi_annual: 5.5,
+  pr: 80,
+  capex: 24408342,
+  n_modules: 770,
+  module_brand: "Jinko Solar",
+  module_model: "JKM370M-72",
+  module_power: 370,
+  inverter_brand: "5 onduleurs (55 strings x 14 modules)",
+  n_inverters: 5,
+  tilt: 30,
+  orientation: "Sud",
+  roof_area: 2145.99,
+};
+const DEFAULT_FIN: FinancialParams = {
+  r: 6,
+  f: 4,
+  D: 0.5,
+  om_rate: 1,
+  DS: 120000,
+  subsidy_rate: 20,
+};
 const emptySlot = (): BillSlot => ({
   file: null,
   preview: null,
   status: "empty",
   data: null,
   edited: null,
+  ocrWarn: "",
 });
 
 // ─── Main Component ───────────────────────────────────────────────────────────
@@ -1607,93 +1603,102 @@ export default function SolarStudyPro() {
   const [genPdf, setGenPdf] = useState(false);
   const fileRefs = useRef<(HTMLInputElement | null)[]>([]);
 
-  const processImage = useCallback(async (file: File, slotIdx: number) => {
+  // ── OCR + parse ──────────────────────────────────────────────────────────
+  const processImage = useCallback(async (file: File, idx: number) => {
     setBills((prev) => {
       const next = [...prev];
-      next[slotIdx] = {
-        ...next[slotIdx],
+      next[idx] = {
+        ...next[idx],
         file,
         preview: URL.createObjectURL(file),
         status: "processing",
+        ocrWarn: "",
       };
       return next;
     });
-
     try {
-      // ── Tesseract.js: free, runs entirely in the browser, zero API cost ──
       const {
         data: { text },
-      } = await Tesseract.recognize(file, "fra+eng", {
-        logger: () => {}, // suppress console noise
-      });
-
-      const parsed = parseSonelgazBill(text, slotIdx);
-
+      } = await Tesseract.recognize(file, "fra", { logger: () => {} });
+      const { data, warn } = parseSonelgazBill(text, idx);
       setBills((prev) => {
         const next = [...prev];
-        next[slotIdx] = {
-          ...next[slotIdx],
+        next[idx] = {
+          ...next[idx],
           status: "done",
-          data: parsed,
-          edited: { ...parsed },
+          data,
+          edited: { ...data },
+          ocrWarn: warn,
         };
         return next;
       });
-    } catch (e) {
-      // Even on OCR failure, open the slot in manual-entry mode so the
-      // user can type values themselves — nothing is lost.
+    } catch {
       const fallback: BillData = {
         hp_kwh: 0,
         peak_kwh: 0,
         total_da: 0,
-        month: slotIdx + 1,
+        month: idx + 1,
         year: new Date().getFullYear(),
       };
       setBills((prev) => {
         const next = [...prev];
-        next[slotIdx] = {
-          ...next[slotIdx],
-          status: "done", // keep "done" so the slot is editable
+        next[idx] = {
+          ...next[idx],
+          status: "done",
           data: fallback,
           edited: { ...fallback },
-          error: "OCR partiel — vérifiez les valeurs ci-dessous",
+          ocrWarn: "OCR echoue — saisie manuelle requise",
         };
         return next;
       });
     }
   }, []);
 
-  const updateBillField = (
-    slotIdx: number,
-    field: keyof BillData,
-    value: number,
-  ) => {
+  const manualSlot = (idx: number) => {
+    const fallback: BillData = {
+      hp_kwh: 0,
+      peak_kwh: 0,
+      total_da: 0,
+      month: idx + 1,
+      year: new Date().getFullYear(),
+    };
     setBills((prev) => {
       const next = [...prev];
-      if (next[slotIdx].edited) {
-        next[slotIdx] = {
-          ...next[slotIdx],
-          edited: { ...next[slotIdx].edited!, [field]: value },
+      next[idx] = {
+        ...next[idx],
+        status: "done",
+        data: fallback,
+        edited: { ...fallback },
+        ocrWarn: "Saisie manuelle",
+      };
+      return next;
+    });
+  };
+
+  const updateField = (idx: number, field: keyof BillData, value: number) => {
+    setBills((prev) => {
+      const next = [...prev];
+      if (next[idx].edited)
+        next[idx] = {
+          ...next[idx],
+          edited: { ...next[idx].edited!, [field]: value },
         };
-      }
       return next;
     });
   };
 
   const doneBills = bills.filter((b) => b.status === "done").length;
-  const canCompute = doneBills >= 6;
 
   const compute = () => {
     setComputing(true);
     setTimeout(() => {
-      const r = runStudy(bills, sys, fin);
-      setResults(r);
+      setResults(runStudy(bills, sys, fin));
       setComputing(false);
       setStep(4);
-    }, 400);
+    }, 300);
   };
 
-  const downloadPDF = async () => {
+  const downloadPDF = () => {
     if (!results) return;
     setGenPdf(true);
     setTimeout(() => {
@@ -1702,72 +1707,115 @@ export default function SolarStudyPro() {
     }, 100);
   };
 
-  // ── STEP 0: Welcome ──
+  // ── STEP 0: Welcome ───────────────────────────────────────────────────────
   if (step === 0)
     return (
-      <div className="min-h-screen bg-[#0d1117] flex items-center justify-center p-6 font-mono">
-        <div className="max-w-xl w-full">
-          <div className="mb-8">
-            <div className="inline-block bg-amber-500/10 border border-amber-500/30 rounded px-3 py-1 text-amber-400 text-xs mb-4 tracking-widest">
-              SOLARANALYTICS.DZ v1.0
-            </div>
-            <h1 className="text-4xl font-bold text-white mb-3">
-              Étude Technico-<span className="text-amber-400">Économique</span>
-            </h1>
-            <p className="text-slate-400 leading-relaxed">
-              Importez 12 factures Sonelgaz. L&apos;OCR local extrait les
-              données, calcule le SCR réel, et génère un rapport bancable
-              complet — 100% gratuit, tout s&apos;exécute dans votre navigateur.
-            </p>
+      <div
+        style={{ backgroundColor: C.navy }}
+        className="min-h-screen flex items-center justify-center p-6"
+      >
+        <div className="max-w-lg w-full">
+          <div className="mb-2" style={{ color: C.cream }}>
+            <span
+              className="text-xs tracking-[0.3em] font-semibold border px-2 py-0.5 rounded"
+              style={{ borderColor: C.cream + "40" }}
+            >
+              SOLARANALYTICS.DZ — v1.0
+            </span>
           </div>
+          <h1
+            className="text-4xl font-bold mt-4 mb-3 leading-tight"
+            style={{ color: C.light }}
+          >
+            Etude Technico-
+            <br />
+            <span style={{ color: C.cream }}>Economique PV</span>
+          </h1>
+          <p
+            className="mb-8 leading-relaxed text-sm"
+            style={{ color: C.light + "99" }}
+          >
+            Importez vos factures Sonelgaz. L&apos;OCR extrait les donnees, le
+            moteur calcule le SCR reel mensuel, et un rapport bancable PDF est
+            genere. 100% gratuit — tout s&apos;execute dans votre navigateur.
+          </p>
 
-          <div className="grid grid-cols-2 gap-3 mb-8 text-sm">
+          <div className="grid grid-cols-2 gap-3 mb-8">
             {[
-              ["⚡", "IEC 61724-1:2021", "Norme de calcul PV"],
-              ["📊", "SCR Mensuel Réel", "Jamais de valeur fixe"],
-              ["💰", "DCF 25 ans complet", "VAN, TRI, DRA, IP, LCOE"],
-              ["🆓", "100% Gratuit", "OCR local — aucun API payant"],
-            ].map(([icon, title, sub]) => (
+              ["IEC 61724-1:2021", "Norme internationale de calcul PV"],
+              ["SCR Mensuel Reel", "Jamais de valeur fixe supposee"],
+              ["DCF 25 ans complet", "VAN, TRI, DRA, IP, LCOE"],
+              ["100% Gratuit", "OCR local — aucun API payant"],
+            ].map(([t, s]) => (
               <div
-                key={title}
-                className="bg-slate-900 border border-slate-800 rounded-lg p-3"
+                key={t}
+                className="rounded-xl p-4 border"
+                style={{ backgroundColor: C.navy2, borderColor: C.border }}
               >
-                <div className="text-xl mb-1">{icon}</div>
-                <div className="text-white font-semibold text-xs">{title}</div>
-                <div className="text-slate-500 text-xs">{sub}</div>
+                <div
+                  className="font-bold text-xs mb-1"
+                  style={{ color: C.cream }}
+                >
+                  {t}
+                </div>
+                <div className="text-xs" style={{ color: C.light + "70" }}>
+                  {s}
+                </div>
               </div>
             ))}
           </div>
 
           <button
             onClick={() => setStep(1)}
-            className="w-full bg-amber-500 hover:bg-amber-400 text-black font-bold py-4 rounded-lg transition-colors text-lg"
+            className="w-full py-4 rounded-xl font-bold text-base transition-opacity hover:opacity-90"
+            style={{ backgroundColor: C.cream, color: C.navy }}
           >
-            Démarrer l&apos;étude →
+            Demarrer l&apos;etude →
           </button>
-
-          <p className="text-center text-slate-600 text-xs mt-4">
-            Biskra GHI: 5.5 kWh/m²/j · Tarif HTA 42 · CAPEX Marché Algérien
+          <p
+            className="text-center text-xs mt-4"
+            style={{ color: C.light + "40" }}
+          >
+            Biskra GHI: 5.5 kWh/m²/j · Tarif HTA 42 · Reference Univ. Biskra
+            2025-2026
           </p>
         </div>
       </div>
     );
 
-  // ── STEP 1: Bill Upload ──
+  // ── STEP 1: Bills ─────────────────────────────────────────────────────────
   if (step === 1)
     return (
-      <div className="min-h-screen bg-[#0d1117] p-6 font-mono">
-        <StepHeader
+      <div style={{ backgroundColor: C.navy }} className="min-h-screen p-5">
+        <WizardHeader
           step={1}
           total={4}
           title="Factures Sonelgaz"
-          sub="12 factures = 1 an de consommation réelle"
+          sub="Importez jusqu'a 12 factures — OCR automatique + saisie manuelle"
         />
 
         <div className="max-w-4xl mx-auto">
-          <div className="grid grid-cols-3 md:grid-cols-4 gap-3 mb-6">
+          {/* Tip */}
+          <div
+            className="rounded-xl p-3 mb-5 border text-xs"
+            style={{
+              backgroundColor: C.navy2,
+              borderColor: C.cream + "30",
+              color: C.light + "80",
+            }}
+          >
+            <span style={{ color: C.cream }} className="font-semibold">
+              Conseil facture HTA Tarif 42 :
+            </span>{" "}
+            L&apos;OCR cherche Cadran 1 (HHP) + Cadran 2 (HHP) + Cadran 3 (HP)
+            et TOTAL FACTURE. Verifiez toujours les valeurs extraites. Utilisez
+            &quot;Saisie manuelle&quot; si l&apos;image est floue.
+          </div>
+
+          {/* Upload grid */}
+          <div className="grid grid-cols-3 md:grid-cols-4 gap-3 mb-5">
             {bills.map((bill, i) => (
-              <div key={i} className="relative">
+              <div key={i}>
                 <input
                   ref={(el) => {
                     fileRefs.current[i] = el;
@@ -1780,78 +1828,126 @@ export default function SolarStudyPro() {
                   }
                 />
                 <div
-                  onClick={() => fileRefs.current[i]?.click()}
-                  className={`relative aspect-[3/4] rounded-lg border-2 cursor-pointer flex flex-col items-center justify-center transition-all overflow-hidden
-                  ${bill.status === "empty" ? "border-slate-700 hover:border-amber-500/50 bg-slate-900/50" : ""}
-                  ${bill.status === "processing" ? "border-amber-500 bg-amber-500/5 animate-pulse" : ""}
-                  ${bill.status === "done" ? "border-emerald-500/50 bg-emerald-500/5" : ""}
-                  ${bill.status === "error" ? "border-red-500/50 bg-red-500/5" : ""}
-                `}
+                  onClick={() =>
+                    bill.status !== "processing" && fileRefs.current[i]?.click()
+                  }
+                  className="relative rounded-xl border-2 cursor-pointer overflow-hidden transition-all"
+                  style={{
+                    aspectRatio: "3/4",
+                    borderColor:
+                      bill.status === "empty"
+                        ? C.border
+                        : bill.status === "processing"
+                          ? C.cream
+                          : bill.ocrWarn
+                            ? "#f59e0b44"
+                            : "#22c55e44",
+                    backgroundColor: C.navy2,
+                  }}
                 >
                   {bill.preview ? (
                     <img
                       src={bill.preview}
-                      className="w-full h-full object-cover opacity-60"
+                      className="w-full h-full object-cover"
+                      style={{ opacity: 0.55 }}
                       alt=""
                     />
                   ) : (
-                    <div className="text-center p-2">
-                      <div className="text-2xl mb-1">📄</div>
-                      <div className="text-slate-500 text-xs">
+                    <div className="absolute inset-0 flex flex-col items-center justify-center gap-1">
+                      <div className="text-xl">📄</div>
+                      <div
+                        className="text-xs"
+                        style={{ color: C.cream + "80" }}
+                      >
                         {MONTHS_FR[i]}
                       </div>
-                      <div className="text-slate-600 text-xs">Clic / Dépôt</div>
                     </div>
                   )}
                   {bill.status === "processing" && (
-                    <div className="absolute inset-0 flex items-center justify-center bg-black/60">
-                      <div className="w-6 h-6 border-2 border-amber-400 border-t-transparent rounded-full animate-spin" />
+                    <div
+                      className="absolute inset-0 flex items-center justify-center"
+                      style={{ backgroundColor: C.navy + "cc" }}
+                    >
+                      <div
+                        className="w-7 h-7 border-2 border-t-transparent rounded-full animate-spin"
+                        style={{ borderColor: C.cream }}
+                      />
                     </div>
                   )}
                   {bill.status === "done" && (
-                    <div className="absolute top-1 right-1 w-5 h-5 bg-emerald-500 rounded-full flex items-center justify-center text-white text-xs">
-                      ✓
+                    <div
+                      className="absolute top-1 right-1 w-5 h-5 rounded-full flex items-center justify-center text-xs font-bold"
+                      style={{
+                        backgroundColor: bill.ocrWarn ? "#f59e0b" : "#22c55e",
+                        color: C.navy,
+                      }}
+                    >
+                      {bill.ocrWarn ? "!" : "✓"}
                     </div>
                   )}
-                  {bill.status === "error" && (
-                    <div className="absolute top-1 right-1 w-5 h-5 bg-red-500 rounded-full flex items-center justify-center text-white text-xs">
-                      !
-                    </div>
-                  )}
-                  <div className="absolute bottom-0 left-0 right-0 bg-black/70 text-xs text-center py-0.5 text-slate-300">
+                  <div
+                    className="absolute bottom-0 left-0 right-0 text-center py-0.5 text-xs font-semibold"
+                    style={{
+                      backgroundColor: C.navy + "cc",
+                      color: C.cream + "cc",
+                    }}
+                  >
                     {MONTHS_FR[i]}
                   </div>
                 </div>
+                {bill.status === "empty" && (
+                  <button
+                    onClick={() => manualSlot(i)}
+                    className="w-full mt-1 text-xs py-1 rounded-lg"
+                    style={{
+                      backgroundColor: C.navy2,
+                      color: C.light + "60",
+                      border: `1px solid ${C.border}`,
+                    }}
+                  >
+                    Saisie manuelle
+                  </button>
+                )}
               </div>
             ))}
           </div>
 
-          {/* OCR quality tip */}
-          <div className="bg-slate-900 border border-amber-500/20 rounded-lg px-4 py-3 mb-4 text-xs text-slate-400">
-            <span className="text-amber-400 font-semibold">
-              💡 Conseil OCR :
-            </span>{" "}
-            Pour de meilleurs résultats, utilisez des photos nettes et bien
-            éclairées. L&apos;OCR tourne localement dans votre navigateur —
-            aucune donnée n&apos;est envoyée à un serveur. Vérifiez et corrigez
-            les valeurs extraites dans le tableau.
-          </div>
-
-          {/* Extracted data review */}
+          {/* Review table */}
           {doneBills > 0 && (
-            <div className="bg-slate-900 border border-slate-800 rounded-xl p-4 mb-6">
-              <h3 className="text-amber-400 font-bold text-sm mb-3">
-                Données extraites — Vérification & Correction
-              </h3>
+            <div
+              className="rounded-xl border overflow-hidden mb-5"
+              style={{ borderColor: C.border }}
+            >
+              <div
+                className="px-4 py-3 font-bold text-sm border-b"
+                style={{
+                  backgroundColor: C.navy2,
+                  color: C.cream,
+                  borderColor: C.border,
+                }}
+              >
+                Verification &amp; Correction des valeurs extraites
+              </div>
               <div className="overflow-x-auto">
                 <table className="w-full text-xs">
                   <thead>
-                    <tr className="text-slate-500 border-b border-slate-800">
-                      <th className="text-left py-2 px-2">Mois</th>
-                      <th className="text-right py-2 px-2">HHP (kWh)</th>
-                      <th className="text-right py-2 px-2">HP (kWh)</th>
-                      <th className="text-right py-2 px-2">Total (DA)</th>
-                      <th className="text-right py-2 px-2">Mois facture</th>
+                    <tr style={{ backgroundColor: C.navy2 }}>
+                      {[
+                        "Mois",
+                        "HHP (kWh)",
+                        "HP Pointe (kWh)",
+                        "Total (DA)",
+                        "Mois fact.",
+                        "An",
+                      ].map((h) => (
+                        <th
+                          key={h}
+                          className="py-2 px-2 text-left font-semibold"
+                          style={{ color: C.light + "70" }}
+                        >
+                          {h}
+                        </th>
+                      ))}
                     </tr>
                   </thead>
                   <tbody>
@@ -1859,43 +1955,86 @@ export default function SolarStudyPro() {
                       b.status === "done" && b.edited ? (
                         <tr
                           key={i}
-                          className="border-b border-slate-800/50 hover:bg-slate-800/30"
+                          className="border-t"
+                          style={{ borderColor: C.border + "40" }}
                         >
-                          <td className="py-1.5 px-2 text-slate-400">
+                          <td
+                            className="py-1.5 px-2 font-semibold"
+                            style={{ color: C.cream + "aa" }}
+                          >
                             {MONTHS_FR[i]}
+                            {b.ocrWarn && (
+                              <div
+                                className="text-xs font-normal"
+                                style={{ color: "#f59e0b" }}
+                              >
+                                {b.ocrWarn}
+                              </div>
+                            )}
                           </td>
                           {(["hp_kwh", "peak_kwh", "total_da"] as const).map(
                             (field) => (
-                              <td key={field} className="py-1 px-2">
+                              <td key={field} className="py-1 px-1.5">
                                 <input
                                   type="number"
                                   value={b.edited![field] || ""}
                                   onChange={(e) =>
-                                    updateBillField(
+                                    updateField(
                                       i,
                                       field,
                                       parseFloat(e.target.value) || 0,
                                     )
                                   }
-                                  className="w-full text-right bg-slate-800 border border-slate-700 rounded px-2 py-0.5 text-white focus:border-amber-500 outline-none"
+                                  className="w-full text-right px-2 py-1 rounded-lg text-xs outline-none"
+                                  style={{
+                                    backgroundColor: C.navy,
+                                    border: `1px solid ${C.border}`,
+                                    color: C.light,
+                                  }}
                                 />
                               </td>
                             ),
                           )}
-                          <td className="py-1 px-2">
+                          <td className="py-1 px-1.5">
                             <input
                               type="number"
                               min={1}
                               max={12}
                               value={b.edited!.month || ""}
                               onChange={(e) =>
-                                updateBillField(
+                                updateField(
                                   i,
                                   "month",
                                   parseInt(e.target.value) || 0,
                                 )
                               }
-                              className="w-16 text-right bg-slate-800 border border-slate-700 rounded px-2 py-0.5 text-white focus:border-amber-500 outline-none"
+                              className="w-16 text-center px-2 py-1 rounded-lg text-xs outline-none"
+                              style={{
+                                backgroundColor: C.navy,
+                                border: `1px solid ${C.border}`,
+                                color: C.light,
+                              }}
+                            />
+                          </td>
+                          <td className="py-1 px-1.5">
+                            <input
+                              type="number"
+                              min={2020}
+                              max={2030}
+                              value={b.edited!.year || ""}
+                              onChange={(e) =>
+                                updateField(
+                                  i,
+                                  "year",
+                                  parseInt(e.target.value) || 0,
+                                )
+                              }
+                              className="w-20 text-center px-2 py-1 rounded-lg text-xs outline-none"
+                              style={{
+                                backgroundColor: C.navy,
+                                border: `1px solid ${C.border}`,
+                                color: C.light,
+                              }}
                             />
                           </td>
                         </tr>
@@ -1904,9 +2043,12 @@ export default function SolarStudyPro() {
                   </tbody>
                 </table>
               </div>
-              <div className="mt-3 text-xs text-slate-500">
-                {doneBills} facture(s) traitée(s) — Les mois manquants
-                utiliseront la consommation moyenne calculée
+              <div
+                className="px-4 py-2 text-xs"
+                style={{ backgroundColor: C.navy2, color: C.light + "50" }}
+              >
+                {doneBills}/12 factures renseignees — les mois manquants
+                utilisent la consommation moyenne
               </div>
             </div>
           )}
@@ -1914,49 +2056,50 @@ export default function SolarStudyPro() {
           <div className="flex gap-3">
             <button
               onClick={() => setStep(0)}
-              className="flex-1 border border-slate-700 text-slate-400 py-3 rounded-lg hover:border-slate-500"
+              className="flex-1 py-3 rounded-xl text-sm"
+              style={{ border: `1px solid ${C.border}`, color: C.light + "70" }}
             >
-              ← Retour
+              Retour
             </button>
             <button
               onClick={() => setStep(2)}
               disabled={doneBills < 1}
-              className="flex-2 flex-grow bg-amber-500 disabled:bg-slate-700 disabled:text-slate-500 text-black font-bold py-3 rounded-lg"
+              className="flex-grow py-3 rounded-xl font-bold transition-opacity hover:opacity-90 disabled:opacity-30"
+              style={{ backgroundColor: C.cream, color: C.navy }}
             >
-              Suivant → ({doneBills}/12 factures)
+              Suivant — Systeme ({doneBills}/12 factures)
             </button>
           </div>
         </div>
       </div>
     );
 
-  // ── STEP 2: System Parameters ──
+  // ── STEP 2: System ────────────────────────────────────────────────────────
   if (step === 2)
     return (
-      <div className="min-h-screen bg-[#0d1117] p-6 font-mono">
-        <StepHeader
+      <div style={{ backgroundColor: C.navy }} className="min-h-screen p-5">
+        <WizardHeader
           step={2}
           total={4}
-          title="Paramètres Système"
-          sub="Configuration du système PV"
+          title="Systeme PV"
+          sub="Configuration technique de l'installation"
         />
-        <div className="max-w-2xl mx-auto space-y-6">
-          <Section title="Informations Projet">
-            <FormField
-              label="Nom du bâtiment"
+        <div className="max-w-2xl mx-auto space-y-5">
+          <Card title="Projet">
+            <TxtField
+              label="Nom du batiment"
               value={sys.building_name}
               onChange={(v) => setSys({ ...sys, building_name: v })}
             />
-            <FormField
+            <TxtField
               label="Adresse"
               value={sys.building_address}
               onChange={(v) => setSys({ ...sys, building_address: v })}
             />
-          </Section>
-
-          <Section title="Système PV">
+          </Card>
+          <Card title="Modules & Onduleurs">
             <NumField
-              label="Puissance installée (kWp)"
+              label="Puissance installee (kWp)"
               value={sys.p_installed}
               onChange={(v) => setSys({ ...sys, p_installed: v })}
               step={0.01}
@@ -1966,13 +2109,13 @@ export default function SolarStudyPro() {
               value={sys.n_modules}
               onChange={(v) => setSys({ ...sys, n_modules: v })}
             />
-            <FormField
+            <TxtField
               label="Marque module"
               value={sys.module_brand}
               onChange={(v) => setSys({ ...sys, module_brand: v })}
             />
-            <FormField
-              label="Modèle module"
+            <TxtField
+              label="Modele module"
               value={sys.module_model}
               onChange={(v) => setSys({ ...sys, module_model: v })}
             />
@@ -1981,7 +2124,7 @@ export default function SolarStudyPro() {
               value={sys.module_power}
               onChange={(v) => setSys({ ...sys, module_power: v })}
             />
-            <FormField
+            <TxtField
               label="Onduleurs"
               value={sys.inverter_brand}
               onChange={(v) => setSys({ ...sys, inverter_brand: v })}
@@ -1991,158 +2134,155 @@ export default function SolarStudyPro() {
               value={sys.n_inverters}
               onChange={(v) => setSys({ ...sys, n_inverters: v })}
             />
-          </Section>
-
-          <Section title="Site & Performance">
+          </Card>
+          <Card title="Site & Performance">
             <NumField
-              label="Irradiation (GHI) kWh/m²/jour"
+              label="GHI annuel (kWh/m2/jour)"
               value={sys.ghi_annual}
               onChange={(v) => setSys({ ...sys, ghi_annual: v })}
               step={0.1}
-              note="Biskra = 5.5 | NASA POWER recommandé"
+              hint="Biskra=5.5 | Alger=4.8 | Adrar=6.8"
             />
             <NumField
               label="Performance Ratio PR (%)"
               value={sys.pr}
               onChange={(v) => setSys({ ...sys, pr: v })}
               step={1}
-              note="75–85% typique"
+              hint="75-85% typique — 80% par defaut"
             />
             <NumField
-              label="Inclinaison (°)"
+              label="Inclinaison (deg)"
               value={sys.tilt}
               onChange={(v) => setSys({ ...sys, tilt: v })}
             />
-            <FormField
+            <TxtField
               label="Orientation"
               value={sys.orientation}
               onChange={(v) => setSys({ ...sys, orientation: v })}
             />
             <NumField
-              label="Surface toiture (m²)"
+              label="Surface toiture (m2)"
               value={sys.roof_area}
               onChange={(v) => setSys({ ...sys, roof_area: v })}
             />
             <NumField
-              label="CAPEX Total (DA)"
+              label="CAPEX total (DA)"
               value={sys.capex}
               onChange={(v) => setSys({ ...sys, capex: v })}
-              step={1000}
-              note="Inclure modules + onduleurs + câbles + installation"
+              step={10000}
+              hint="Modules + onduleurs + cables + installation + 5% imprevu"
             />
-          </Section>
-
-          <div className="flex gap-3">
-            <button
-              onClick={() => setStep(1)}
-              className="flex-1 border border-slate-700 text-slate-400 py-3 rounded-lg hover:border-slate-500"
-            >
-              ← Retour
-            </button>
-            <button
-              onClick={() => setStep(3)}
-              className="flex-grow bg-amber-500 text-black font-bold py-3 rounded-lg"
-            >
-              Suivant →
-            </button>
-          </div>
+          </Card>
+          <NavButtons
+            onBack={() => setStep(1)}
+            onNext={() => setStep(3)}
+            nextLabel="Suivant — Financier"
+          />
         </div>
       </div>
     );
 
-  // ── STEP 3: Financial Parameters ──
+  // ── STEP 3: Financial ─────────────────────────────────────────────────────
   if (step === 3)
     return (
-      <div className="min-h-screen bg-[#0d1117] p-6 font-mono">
-        <StepHeader
+      <div style={{ backgroundColor: C.navy }} className="min-h-screen p-5">
+        <WizardHeader
           step={3}
           total={4}
-          title="Paramètres Financiers"
-          sub="Hypothèses économiques pour le modèle DCF 25 ans"
+          title="Parametres Financiers"
+          sub="Hypotheses du modele DCF 25 ans"
         />
-        <div className="max-w-2xl mx-auto space-y-6">
-          <Section title="Taux & Inflation">
+        <div className="max-w-2xl mx-auto space-y-5">
+          <Card title="Taux & Inflation">
             <NumField
               label="Taux d'actualisation r (%)"
               value={fin.r}
               onChange={(v) => setFin({ ...fin, r: v })}
               step={0.5}
-              note="Coût du capital — 6% standard Algérie"
+              hint="Cout du capital — 6% standard Algerie"
             />
             <NumField
-              label="Inflation tarifaire f (%)"
+              label="Inflation tarifaire f (%/an)"
               value={fin.f}
               onChange={(v) => setFin({ ...fin, f: v })}
               step={0.5}
-              note="Évolution tarifaire Sonelgaz — 4%/an historique"
+              hint="Evolution tarifaire Sonelgaz — 4%/an historique"
             />
             <NumField
-              label="Dégradation modules D (%/an)"
+              label="Degradation modules D (%/an)"
               value={fin.D}
               onChange={(v) => setFin({ ...fin, D: v })}
               step={0.1}
-              note="Garantie constructeur — 0.5%/an Jinko"
+              hint="Garantie Jinko JKM — 0.5%/an"
             />
-          </Section>
-
-          <Section title="Coûts & Économies">
+          </Card>
+          <Card title="Couts & Economies">
             <NumField
-              label="O&M (% du CAPEX par an)"
+              label="O&M (% CAPEX/an)"
               value={fin.om_rate}
               onChange={(v) => setFin({ ...fin, om_rate: v })}
               step={0.1}
-              note="Maintenance & assurance — 1% standard"
+              hint="Maintenance + assurance — 1% standard"
             />
             <NumField
-              label="Économies demande DS (DA/an)"
+              label="Economies demande DS (DA/an)"
               value={fin.DS}
               onChange={(v) => setFin({ ...fin, DS: v })}
               step={1000}
-              note="⚠️ FIXE — Jamais indexé à l'inflation tarifaire"
+              hint="Valeur FIXE — ne pas indexer a l'inflation tarifaire"
             />
-          </Section>
-
-          <Section title="Subvention">
             <NumField
               label="Taux subvention Sc2 (%)"
               value={fin.subsidy_rate}
               onChange={(v) => setFin({ ...fin, subsidy_rate: v })}
               step={5}
-              note="Dispositif APRUE — 20% standard"
+              hint="Dispositif APRUE — 20% standard"
             />
-          </Section>
+          </Card>
 
-          <div className="bg-amber-500/10 border border-amber-500/30 rounded-lg p-4 text-xs">
-            <div className="text-amber-400 font-bold mb-2">
-              ⚠️ Avertissement Critique — PRD Section 3.2
+          {/* Critical warning */}
+          <div
+            className="rounded-xl p-4 border text-sm"
+            style={{
+              border: `1px solid ${C.cream}40`,
+              backgroundColor: C.cream + "08",
+              color: C.light + "90",
+            }}
+          >
+            <div className="font-bold mb-1" style={{ color: C.cream }}>
+              Avertissement critique — DS fixe
             </div>
-            <div className="text-slate-400">
-              DS = {fin.DS.toLocaleString()} DA/an est une valeur{" "}
-              <strong className="text-white">FIXE</strong>. Elle ne sera jamais
-              multipliée par (1+f)^(n-1). Erreur fréquente dans les études PV
-              algériennes.
-            </div>
+            DS = {fin.DS.toLocaleString()} DA/an est une constante. Dans le
+            moteur de calcul, elle n&apos;est{" "}
+            <strong style={{ color: C.cream }}>jamais</strong> multipliee par
+            (1+f)^(n-1). C&apos;est l&apos;erreur la plus frequente dans les
+            etudes PV algeriennes.
           </div>
 
           <div className="flex gap-3">
             <button
               onClick={() => setStep(2)}
-              className="flex-1 border border-slate-700 text-slate-400 py-3 rounded-lg"
+              className="flex-1 py-3 rounded-xl text-sm"
+              style={{ border: `1px solid ${C.border}`, color: C.light + "70" }}
             >
-              ← Retour
+              Retour
             </button>
             <button
               onClick={compute}
-              disabled={computing || !canCompute}
-              className="flex-grow bg-amber-500 disabled:bg-slate-700 disabled:text-slate-500 text-black font-bold py-3 rounded-lg flex items-center justify-center gap-2"
+              disabled={computing}
+              className="flex-grow py-3 rounded-xl font-bold transition-opacity hover:opacity-90 disabled:opacity-40"
+              style={{ backgroundColor: C.cream, color: C.navy }}
             >
               {computing ? (
-                <>
-                  <div className="w-5 h-5 border-2 border-black border-t-transparent rounded-full animate-spin" />{" "}
+                <span className="flex items-center justify-center gap-2">
+                  <span
+                    className="w-4 h-4 border-2 border-t-transparent rounded-full animate-spin"
+                    style={{ borderColor: C.navy }}
+                  />
                   Calcul en cours...
-                </>
+                </span>
               ) : (
-                "⚡ Calculer l'étude complète"
+                "Calculer l'etude complete"
               )}
             </button>
           </div>
@@ -2150,172 +2290,166 @@ export default function SolarStudyPro() {
       </div>
     );
 
-  // ── STEP 4: Results ──
-  if (step === 4 && results)
+  // ── STEP 4: Results ───────────────────────────────────────────────────────
+  if (step === 4 && results) {
+    const r = results;
     return (
-      <div className="min-h-screen bg-[#0d1117] p-6 font-mono">
+      <div style={{ backgroundColor: C.navy }} className="min-h-screen p-5">
         <div className="max-w-4xl mx-auto">
-          <div className="flex items-center justify-between mb-6">
+          {/* Header */}
+          <div className="flex items-start justify-between mb-6 gap-4">
             <div>
-              <div className="text-amber-400 text-xs tracking-widest mb-1">
-                RÉSULTATS ÉTUDE
+              <div
+                className="text-xs tracking-widest mb-1"
+                style={{ color: C.cream + "80" }}
+              >
+                RESULTATS ETUDE
               </div>
-              <h1 className="text-2xl font-bold text-white">
+              <h1 className="text-2xl font-bold" style={{ color: C.light }}>
                 {sys.building_name}
               </h1>
-              <p className="text-slate-500 text-sm">
-                {sys.p_installed} kWp | {sys.n_modules} modules | GHI{" "}
-                {sys.ghi_annual} kWh/m²/j
+              <p className="text-sm mt-1" style={{ color: C.light + "60" }}>
+                {sys.p_installed} kWp · {sys.n_modules} modules · GHI{" "}
+                {sys.ghi_annual} kWh/m²/j · T₀ = {r.t0.toFixed(4)} DA/kWh
               </p>
             </div>
             <button
               onClick={downloadPDF}
               disabled={genPdf}
-              className="bg-amber-500 hover:bg-amber-400 text-black font-bold px-6 py-3 rounded-lg flex items-center gap-2 transition-colors"
+              className="shrink-0 px-6 py-3 rounded-xl font-bold transition-opacity hover:opacity-90 disabled:opacity-40 text-sm"
+              style={{ backgroundColor: C.cream, color: C.navy }}
             >
-              {genPdf ? (
-                <>
-                  <div className="w-4 h-4 border-2 border-black border-t-transparent rounded-full animate-spin" />{" "}
-                  Génération...
-                </>
-              ) : (
-                "📄 Télécharger PDF"
-              )}
+              {genPdf ? "Generation..." : "Telecharger PDF"}
             </button>
           </div>
 
-          {/* KPI Grid */}
-          <div className="grid grid-cols-2 md:grid-cols-4 gap-3 mb-6">
+          {/* KPI grid */}
+          <div className="grid grid-cols-2 md:grid-cols-4 gap-3 mb-5">
             {[
               {
                 l: "VAN Sc1",
-                v: `${(results.npv_sc1 / 1e6).toFixed(2)} M DA`,
-                sub: results.npv_sc1 > 0 ? "✓ Projet viable" : "✗ Non viable",
-                color: results.npv_sc1 > 0 ? "emerald" : "red",
+                v: `${(r.npv_sc1 / 1e6).toFixed(2)} M DA`,
+                ok: r.npv_sc1 > 0,
               },
-              {
-                l: "TRI Sc1",
-                v: `${results.irr_sc1}%`,
-                sub: `vs r=${fin.r}% — ${results.irr_sc1 > fin.r ? "✓ Rentable" : "Risqué"}`,
-                color: results.irr_sc1 > fin.r ? "emerald" : "red",
-              },
-              {
-                l: "DRS Sc1",
-                v: `${results.spp_sc1} ans`,
-                sub: `DRA: ${results.dpp_sc1 ?? ">25"} ans`,
-                color: "amber",
-              },
-              {
-                l: "LCOE",
-                v: `${results.lcoe} DA/kWh`,
-                sub: `Tarif réseau: ${results.t0.toFixed(2)} DA/kWh`,
-                color: "blue",
-              },
-              {
-                l: "SCR Calculé",
-                v: `${results.scr}%`,
-                sub: "vs 70% supposé standard",
-                color: "amber",
-              },
+              { l: "TRI Sc1", v: `${r.irr_sc1}%`, ok: r.irr_sc1 > fin.r },
+              { l: "DRS Sc1", v: `${r.spp_sc1} ans`, ok: true },
+              { l: "LCOE", v: `${r.lcoe} DA/kWh`, ok: true },
+              { l: "SCR Calcule", v: `${r.scr}%`, ok: true },
               {
                 l: "E_annual",
-                v: `${(results.e_annual / 1000).toFixed(0)} MWh`,
-                sub: `FLEH: ${results.fleh} h/an`,
-                color: "blue",
+                v: `${(r.e_annual / 1000).toFixed(0)} MWh`,
+                ok: true,
               },
               {
-                l: "VAN Sc2 (+20%)",
-                v: `${(results.npv_sc2 / 1e6).toFixed(2)} M DA`,
-                sub: `DRA: ${results.dpp_sc2 ?? ">25"} ans`,
-                color: "emerald",
+                l: "VAN Sc2",
+                v: `${(r.npv_sc2 / 1e6).toFixed(2)} M DA`,
+                ok: r.npv_sc2 > 0,
               },
-              {
-                l: "CO₂ Évité",
-                v: `${results.co2_yr1} t/an`,
-                sub: `${results.trees_equiv} arbres équivalent`,
-                color: "emerald",
-              },
+              { l: "CO2 evite", v: `${r.co2_yr1} t/an`, ok: true },
             ].map((k) => (
               <div
                 key={k.l}
-                className={`bg-slate-900 border rounded-xl p-4
-              ${k.color === "emerald" ? "border-emerald-500/30" : k.color === "amber" ? "border-amber-500/30" : k.color === "red" ? "border-red-500/30" : "border-blue-500/30"}`}
+                className="rounded-xl p-4 border"
+                style={{
+                  backgroundColor: C.navy2,
+                  borderColor: k.ok ? C.cream + "25" : "#ef444433",
+                }}
               >
-                <div className="text-slate-500 text-xs mb-1">{k.l}</div>
+                <div className="text-xs mb-1" style={{ color: C.light + "50" }}>
+                  {k.l}
+                </div>
                 <div
-                  className={`text-xl font-bold ${k.color === "emerald" ? "text-emerald-400" : k.color === "amber" ? "text-amber-400" : k.color === "red" ? "text-red-400" : "text-blue-400"}`}
+                  className="text-lg font-bold"
+                  style={{ color: k.ok ? C.cream : "#ef4444" }}
                 >
                   {k.v}
                 </div>
-                <div className="text-slate-600 text-xs mt-1">{k.sub}</div>
               </div>
             ))}
           </div>
 
-          {/* Monthly breakdown */}
-          <div className="bg-slate-900 border border-slate-800 rounded-xl p-4 mb-4">
-            <h3 className="text-amber-400 font-bold text-sm mb-4">
-              Production vs Consommation Mensuelle (kWh)
-            </h3>
+          {/* Monthly table */}
+          <div
+            className="rounded-xl border overflow-hidden mb-4"
+            style={{ borderColor: C.border }}
+          >
+            <div
+              className="px-4 py-3 font-bold text-sm"
+              style={{ backgroundColor: C.navy2, color: C.cream }}
+            >
+              Production vs Consommation Mensuelle
+            </div>
             <div className="overflow-x-auto">
               <table className="w-full text-xs">
                 <thead>
-                  <tr className="text-slate-500 border-b border-slate-800">
-                    <th className="py-2 px-2 text-left">Mois</th>
+                  <tr style={{ backgroundColor: C.navy2 }}>
+                    <th
+                      className="py-2 px-2 text-left"
+                      style={{ color: C.light + "60" }}
+                    >
+                      Indicateur
+                    </th>
                     {MONTHS_FR.map((m) => (
-                      <th key={m} className="py-2 px-1 text-right">
+                      <th
+                        key={m}
+                        className="py-2 px-1 text-right"
+                        style={{ color: C.light + "60" }}
+                      >
                         {m}
                       </th>
                     ))}
-                    <th className="py-2 px-2 text-right font-bold">TOTAL</th>
+                    <th
+                      className="py-2 px-2 text-right font-bold"
+                      style={{ color: C.cream }}
+                    >
+                      TOTAL
+                    </th>
                   </tr>
                 </thead>
                 <tbody>
                   {[
+                    { label: "E_PV (kWh)", vals: r.monthly_pv, color: C.cream },
                     {
-                      label: "E_PV",
-                      values: results.monthly_pv,
-                      color: "text-amber-400",
+                      label: "E_Cons (kWh)",
+                      vals: r.monthly_cons,
+                      color: "#60a5fa",
                     },
+                    { label: "SC (kWh)", vals: r.monthly_sc, color: "#4ade80" },
                     {
-                      label: "E_Cons",
-                      values: results.monthly_cons,
-                      color: "text-blue-400",
-                    },
-                    {
-                      label: "SC",
-                      values: results.monthly_sc,
-                      color: "text-emerald-400",
-                    },
-                    {
-                      label: "SCR%",
-                      values: results.monthly_scr.map((v) => v),
-                      color: "text-purple-400",
+                      label: "SCR (%)",
+                      vals: r.monthly_scr,
+                      color: C.light + "80",
                       unit: "%",
                     },
                   ].map((row) => (
                     <tr
                       key={row.label}
-                      className="border-b border-slate-800/50"
+                      className="border-t"
+                      style={{ borderColor: C.border + "30" }}
                     >
-                      <td className={`py-1.5 px-2 font-semibold ${row.color}`}>
+                      <td
+                        className="py-1.5 px-2 font-semibold"
+                        style={{ color: row.color }}
+                      >
                         {row.label}
                       </td>
-                      {row.values.map((v, i) => (
+                      {row.vals.map((v, i) => (
                         <td
                           key={i}
-                          className={`py-1.5 px-1 text-right text-slate-300 text-xs`}
+                          className="py-1.5 px-1 text-right"
+                          style={{ color: C.light + "90" }}
                         >
                           {v.toLocaleString()}
-                          {row.unit || ""}
+                          {row.unit ?? ""}
                         </td>
                       ))}
                       <td
-                        className={`py-1.5 px-2 text-right font-bold ${row.color}`}
+                        className="py-1.5 px-2 text-right font-bold"
+                        style={{ color: row.color }}
                       >
                         {row.unit
-                          ? `${Math.round(row.values.reduce((a, b) => a + b, 0) / 12)}%`
-                          : row.values
+                          ? `${Math.round(row.vals.reduce((a, b) => a + b, 0) / 12)}%`
+                          : row.vals
                               .reduce((a, b) => a + b, 0)
                               .toLocaleString()}
                       </td>
@@ -2326,55 +2460,63 @@ export default function SolarStudyPro() {
             </div>
           </div>
 
-          {/* Scenario comparison */}
+          {/* Scenarios */}
           <div className="grid grid-cols-2 gap-3 mb-4">
-            {[
-              {
-                title: "Scénario 1 — Sans Subvention",
-                capex: sys.capex,
-                color: "amber",
-              },
-              {
-                title: `Scénario 2 — Subvention ${fin.subsidy_rate}%`,
-                capex: results.capex_sc2,
-                color: "blue",
-              },
-            ].map((sc, si) => (
+            {(
+              [
+                {
+                  title: `Sc1 — Sans subvention`,
+                  cap: sys.capex,
+                  npv: r.npv_sc1,
+                  irr: r.irr_sc1,
+                  spp: r.spp_sc1,
+                  dpp: r.dpp_sc1,
+                  pi: r.pi_sc1,
+                  color: C.cream,
+                },
+                {
+                  title: `Sc2 — Subvention ${fin.subsidy_rate}%`,
+                  cap: r.capex_sc2,
+                  npv: r.npv_sc2,
+                  irr: r.irr_sc2,
+                  spp: r.spp_sc2,
+                  dpp: r.dpp_sc2,
+                  pi: r.pi_sc2,
+                  color: "#60a5fa",
+                },
+              ] as const
+            ).map((sc) => (
               <div
-                key={si}
-                className={`bg-slate-900 border ${sc.color === "amber" ? "border-amber-500/30" : "border-blue-500/30"} rounded-xl p-4`}
+                key={sc.title}
+                className="rounded-xl border p-4"
+                style={{
+                  backgroundColor: C.navy2,
+                  borderColor: sc.color + "33",
+                }}
               >
-                <h3
-                  className={`font-bold text-sm mb-3 ${sc.color === "amber" ? "text-amber-400" : "text-blue-400"}`}
+                <div
+                  className="font-bold text-sm mb-3"
+                  style={{ color: sc.color }}
                 >
                   {sc.title}
-                </h3>
+                </div>
                 {[
-                  ["CAPEX", `${sc.capex.toLocaleString()} DA`],
-                  [
-                    "VAN",
-                    `${si === 0 ? results.npv_sc1 : results.npv_sc2} DA`.replace(
-                      /(\d)(?=(\d{3})+(?!\d))/g,
-                      "$1,",
-                    ),
-                  ],
-                  ["TRI", `${si === 0 ? results.irr_sc1 : results.irr_sc2}%`],
-                  [
-                    "DRS",
-                    `${si === 0 ? results.spp_sc1 : results.spp_sc2} ans`,
-                  ],
-                  [
-                    "DRA",
-                    `${si === 0 ? (results.dpp_sc1 ?? ">25") : (results.dpp_sc2 ?? ">25")} ans`,
-                  ],
-                  ["IP", `${si === 0 ? results.pi_sc1 : results.pi_sc2}`],
+                  ["CAPEX", sc.cap.toLocaleString() + " DA"],
+                  ["VAN", sc.npv.toLocaleString() + " DA"],
+                  ["TRI", sc.irr + "%"],
+                  ["DRS", sc.spp + " ans"],
+                  ["DRA", (sc.dpp ?? ">25") + " ans"],
+                  ["IP", String(sc.pi)],
                 ].map(([k, v]) => (
                   <div
                     key={k}
-                    className="flex justify-between text-xs py-1 border-b border-slate-800/50"
+                    className="flex justify-between text-xs py-1 border-b"
+                    style={{ borderColor: C.border + "30" }}
                   >
-                    <span className="text-slate-500">{k}</span>
-                    <span className="text-white font-semibold">{v}</span>
+                    <span style={{ color: C.light + "50" }}>{k}</span>
+                    <span className="font-semibold" style={{ color: C.light }}>
+                      {v}
+                    </span>
                   </div>
                 ))}
               </div>
@@ -2382,27 +2524,47 @@ export default function SolarStudyPro() {
           </div>
 
           {/* Environmental */}
-          <div className="bg-slate-900 border border-emerald-500/20 rounded-xl p-4 mb-4">
-            <h3 className="text-emerald-400 font-bold text-sm mb-3">
+          <div
+            className="rounded-xl border p-4 mb-4"
+            style={{ backgroundColor: C.navy2, borderColor: "#22c55e22" }}
+          >
+            <div
+              className="font-bold text-sm mb-3"
+              style={{ color: "#4ade80" }}
+            >
               Impact Environnemental
-            </h3>
+            </div>
             <div className="grid grid-cols-4 gap-3 text-center">
               {[
-                ["🌿", `${results.co2_yr1}`, "tCO₂/an évitées"],
-                ["🌳", `${results.trees_equiv}`, "arbres équivalent"],
-                ["🚗", `${results.vehicles_equiv}`, "véhicules retirés"],
+                ["tCO2/an", String(r.co2_yr1), "CO2 evite"],
+                ["arbres", String(r.trees_equiv), "Equivalent arbres"],
+                ["vehicules", String(r.vehicles_equiv), "Vehicules retires"],
                 [
-                  "☀️",
-                  `${results.nm_revenue.toLocaleString()}`,
-                  "DA/an comptage net",
+                  "DA/an",
+                  r.nm_revenue.toLocaleString(),
+                  "Revenus net metering",
                 ],
-              ].map(([icon, val, label]) => (
-                <div key={label} className="bg-emerald-500/5 rounded-lg p-3">
-                  <div className="text-2xl mb-1">{icon}</div>
-                  <div className="text-emerald-400 font-bold text-sm">
+              ].map(([unit, val, lbl]) => (
+                <div
+                  key={lbl}
+                  className="rounded-lg p-3"
+                  style={{ backgroundColor: "#22c55e0a" }}
+                >
+                  <div
+                    className="text-xl font-bold"
+                    style={{ color: "#4ade80" }}
+                  >
                     {val}
                   </div>
-                  <div className="text-slate-500 text-xs">{label}</div>
+                  <div className="text-xs" style={{ color: "#4ade80" + "80" }}>
+                    {unit}
+                  </div>
+                  <div
+                    className="text-xs mt-0.5"
+                    style={{ color: C.light + "50" }}
+                  >
+                    {lbl}
+                  </div>
                 </div>
               ))}
             </div>
@@ -2411,29 +2573,32 @@ export default function SolarStudyPro() {
           <div className="flex gap-3">
             <button
               onClick={() => setStep(3)}
-              className="border border-slate-700 text-slate-400 px-6 py-3 rounded-lg hover:border-slate-500"
+              className="py-3 px-6 rounded-xl text-sm"
+              style={{ border: `1px solid ${C.border}`, color: C.light + "70" }}
             >
-              ← Modifier
+              Modifier
             </button>
             <button
               onClick={downloadPDF}
               disabled={genPdf}
-              className="flex-grow bg-amber-500 hover:bg-amber-400 text-black font-bold py-3 rounded-lg"
+              className="flex-grow py-3 rounded-xl font-bold transition-opacity hover:opacity-90 disabled:opacity-40"
+              style={{ backgroundColor: C.cream, color: C.navy }}
             >
               {genPdf
-                ? "Génération du PDF..."
-                : "📄 Télécharger Rapport PDF Complet"}
+                ? "Generation du PDF..."
+                : "Telecharger Rapport PDF Complet (9 pages)"}
             </button>
           </div>
         </div>
       </div>
     );
+  }
 
   return null;
 }
 
-// ─── Shared UI Components ─────────────────────────────────────────────────────
-function StepHeader({
+// ─── Shared UI sub-components ─────────────────────────────────────────────────
+function WizardHeader({
   step,
   total,
   title,
@@ -2446,24 +2611,32 @@ function StepHeader({
 }) {
   return (
     <div className="max-w-4xl mx-auto mb-6">
-      <div className="flex items-center gap-2 mb-2">
+      <div className="flex gap-1.5 mb-3">
         {Array.from({ length: total }, (_, i) => (
           <div
             key={i}
-            className={`h-1 flex-1 rounded ${i < step ? "bg-amber-500" : "bg-slate-700"}`}
+            className="h-1 flex-1 rounded-full transition-all"
+            style={{ backgroundColor: i < step ? C.cream : C.cream + "25" }}
           />
         ))}
       </div>
-      <div className="text-amber-400 text-xs tracking-widest">
-        ÉTAPE {step}/{total}
+      <div
+        className="text-xs tracking-[0.25em] font-semibold mb-1"
+        style={{ color: C.cream + "70" }}
+      >
+        ETAPE {step} / {total}
       </div>
-      <h2 className="text-2xl font-bold text-white">{title}</h2>
-      <p className="text-slate-500 text-sm">{sub}</p>
+      <h2 className="text-2xl font-bold" style={{ color: C.light }}>
+        {title}
+      </h2>
+      <p className="text-sm mt-1" style={{ color: C.light + "60" }}>
+        {sub}
+      </p>
     </div>
   );
 }
 
-function Section({
+function Card({
   title,
   children,
 }: {
@@ -2471,16 +2644,22 @@ function Section({
   children: React.ReactNode;
 }) {
   return (
-    <div className="bg-slate-900 border border-slate-800 rounded-xl p-5">
-      <h3 className="text-amber-400 font-bold text-sm mb-4 uppercase tracking-wider">
+    <div
+      className="rounded-xl border p-5"
+      style={{ backgroundColor: C.navy2, borderColor: C.border }}
+    >
+      <div
+        className="text-xs font-bold tracking-widest mb-4 uppercase"
+        style={{ color: C.cream }}
+      >
         {title}
-      </h3>
+      </div>
       <div className="space-y-3">{children}</div>
     </div>
   );
 }
 
-function FormField({
+function TxtField({
   label,
   value,
   onChange,
@@ -2491,12 +2670,19 @@ function FormField({
 }) {
   return (
     <div>
-      <label className="block text-slate-500 text-xs mb-1">{label}</label>
+      <label className="block text-xs mb-1" style={{ color: C.light + "60" }}>
+        {label}
+      </label>
       <input
         type="text"
         value={value}
         onChange={(e) => onChange(e.target.value)}
-        className="w-full bg-slate-800 border border-slate-700 rounded-lg px-3 py-2 text-white text-sm focus:border-amber-500 outline-none"
+        className="w-full px-3 py-2 rounded-lg text-sm outline-none"
+        style={{
+          backgroundColor: C.navy,
+          border: `1px solid ${C.border}`,
+          color: C.light,
+        }}
       />
     </div>
   );
@@ -2507,25 +2693,65 @@ function NumField({
   value,
   onChange,
   step = 1,
-  note,
+  hint,
 }: {
   label: string;
   value: number;
   onChange: (v: number) => void;
   step?: number;
-  note?: string;
+  hint?: string;
 }) {
   return (
     <div>
-      <label className="block text-slate-500 text-xs mb-1">{label}</label>
+      <label className="block text-xs mb-1" style={{ color: C.light + "60" }}>
+        {label}
+      </label>
       <input
         type="number"
         value={value}
         step={step}
         onChange={(e) => onChange(parseFloat(e.target.value) || 0)}
-        className="w-full bg-slate-800 border border-slate-700 rounded-lg px-3 py-2 text-white text-sm focus:border-amber-500 outline-none"
+        className="w-full px-3 py-2 rounded-lg text-sm outline-none"
+        style={{
+          backgroundColor: C.navy,
+          border: `1px solid ${C.border}`,
+          color: C.light,
+        }}
       />
-      {note && <p className="text-slate-600 text-xs mt-0.5">{note}</p>}
+      {hint && (
+        <p className="text-xs mt-0.5" style={{ color: C.light + "35" }}>
+          {hint}
+        </p>
+      )}
+    </div>
+  );
+}
+
+function NavButtons({
+  onBack,
+  onNext,
+  nextLabel,
+}: {
+  onBack: () => void;
+  onNext: () => void;
+  nextLabel: string;
+}) {
+  return (
+    <div className="flex gap-3">
+      <button
+        onClick={onBack}
+        className="flex-1 py-3 rounded-xl text-sm"
+        style={{ border: `1px solid ${C.border}`, color: C.light + "70" }}
+      >
+        Retour
+      </button>
+      <button
+        onClick={onNext}
+        className="flex-grow py-3 rounded-xl font-bold transition-opacity hover:opacity-90"
+        style={{ backgroundColor: C.cream, color: C.navy }}
+      >
+        {nextLabel}
+      </button>
     </div>
   );
 }
