@@ -1,0 +1,68 @@
+export interface WilayaSolarData {
+  id: number;
+  name: string;
+  ghi: number; // Global Horizontal Irradiation in kWh/m²/year
+  suitability: "High" | "Moderate" | "Low";
+}
+
+export const algeriaSolarData: WilayaSolarData[] = [
+  { id: 1, name: "Adrar", ghi: 2350, suitability: "High" },
+  { id: 2, name: "Chlef", ghi: 1750, suitability: "Moderate" },
+  { id: 3, name: "Laghouat", ghi: 2150, suitability: "High" },
+  { id: 4, name: "Oum El Bouaghi", ghi: 1850, suitability: "Moderate" },
+  { id: 5, name: "Batna", ghi: 1950, suitability: "High" },
+  { id: 6, name: "Béjaïa", ghi: 1650, suitability: "Moderate" },
+  { id: 7, name: "Biskra", ghi: 2100, suitability: "High" }, // High potential for your current location
+  { id: 8, name: "Béchar", ghi: 2300, suitability: "High" },
+  { id: 9, name: "Blida", ghi: 1700, suitability: "Moderate" },
+  { id: 10, name: "Bouira", ghi: 1750, suitability: "Moderate" },
+  { id: 11, name: "Tamanrasset", ghi: 2500, suitability: "High" }, // National Peak
+  { id: 12, name: "Tébessa", ghi: 1900, suitability: "High" },
+  { id: 13, name: "Tlemcen", ghi: 1850, suitability: "Moderate" },
+  { id: 14, name: "Tiaret", ghi: 1900, suitability: "High" },
+  { id: 15, name: "Tizi Ouzou", ghi: 1680, suitability: "Moderate" },
+  { id: 16, name: "Algiers", ghi: 1700, suitability: "Moderate" },
+  { id: 17, name: "Djelfa", ghi: 2050, suitability: "High" },
+  { id: 18, name: "Jijel", ghi: 1620, suitability: "Moderate" },
+  { id: 19, name: "Sétif", ghi: 1900, suitability: "High" },
+  { id: 20, name: "Saïda", ghi: 1950, suitability: "High" },
+  { id: 21, name: "Skikda", ghi: 1600, suitability: "Moderate" },
+  { id: 22, name: "Sidi Bel Abbès", ghi: 1880, suitability: "Moderate" },
+  { id: 23, name: "Annaba", ghi: 1650, suitability: "Moderate" },
+  { id: 24, name: "Guelma", ghi: 1750, suitability: "Moderate" },
+  { id: 25, name: "Constantine", ghi: 1800, suitability: "Moderate" },
+  { id: 26, name: "Médéa", ghi: 1820, suitability: "Moderate" },
+  { id: 27, name: "Mostaganem", ghi: 1780, suitability: "Moderate" },
+  { id: 28, name: "M'Sila", ghi: 2000, suitability: "High" },
+  { id: 29, name: "Mascara", ghi: 1850, suitability: "Moderate" },
+  { id: 30, name: "Ouargla", ghi: 2300, suitability: "High" },
+  { id: 31, name: "Oran", ghi: 1820, suitability: "Moderate" },
+  { id: 32, name: "El Bayadh", ghi: 2200, suitability: "High" },
+  { id: 33, name: "Illizi", ghi: 2450, suitability: "High" },
+  { id: 34, name: "Bordj Bou Arréridj", ghi: 1880, suitability: "Moderate" },
+  { id: 35, name: "Boumerdès", ghi: 1680, suitability: "Moderate" },
+  { id: 36, name: "El Tarf", ghi: 1620, suitability: "Moderate" },
+  { id: 37, name: "Tindouf", ghi: 2400, suitability: "High" },
+  { id: 38, name: "Tissemsilt", ghi: 1800, suitability: "Moderate" },
+  { id: 39, name: "El Oued", ghi: 2250, suitability: "High" },
+  { id: 40, name: "Khenchela", ghi: 1920, suitability: "High" },
+  { id: 41, name: "Souk Ahras", ghi: 1780, suitability: "Moderate" },
+  { id: 42, name: "Tipaza", ghi: 1720, suitability: "Moderate" },
+  { id: 43, name: "Mila", ghi: 1760, suitability: "Moderate" },
+  { id: 44, name: "Aïn Defla", ghi: 1780, suitability: "Moderate" },
+  { id: 45, name: "Naâma", ghi: 2200, suitability: "High" },
+  { id: 46, name: "Aïn Témouchent", ghi: 1850, suitability: "Moderate" },
+  { id: 47, name: "Ghardaïa", ghi: 2250, suitability: "High" },
+  { id: 48, name: "Relizane", ghi: 1820, suitability: "Moderate" },
+  // New Wilayas (Administrative restructure)
+  { id: 49, name: "El M'Ghair", ghi: 2150, suitability: "High" },
+  { id: 50, name: "El Meniaa", ghi: 2300, suitability: "High" },
+  { id: 51, name: "Ouled Djellal", ghi: 2120, suitability: "High" },
+  { id: 52, name: "Bordj Baji Mokhtar", ghi: 2450, suitability: "High" },
+  { id: 53, name: "Béni Abbès", ghi: 2350, suitability: "High" },
+  { id: 54, name: "Timimoun", ghi: 2380, suitability: "High" },
+  { id: 55, name: "Touggourt", ghi: 2280, suitability: "High" },
+  { id: 56, name: "Djanet", ghi: 2480, suitability: "High" },
+  { id: 57, name: "In Salah", ghi: 2450, suitability: "High" },
+  { id: 58, name: "In Guezzam", ghi: 2500, suitability: "High" },
+];
