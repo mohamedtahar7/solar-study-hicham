@@ -1,3239 +1,1560 @@
 "use client";
-// ─────────────────────────────────────────────────────────────────────────────
-//  SolarAnalytics.dz  v2.0
-//  Full 35-Equation PV Techno-Economic Study Engine
-//  IEC 61724-1:2021 · PRD Biskra Methodology · All 58 Wilayas
-// ─────────────────────────────────────────────────────────────────────────────
+// ═══════════════════════════════════════════════════════════════════════════
+//  SolarAnalytics.dz  v3.0 — Complete 55-Equation PV Techno-Economic Engine
+//  IEC 61724-1:2021 · PRD Biskra · 48 Wilayas · Claude Vision OCR
+//  3 Financial Scenarios · Sensitivity Analysis · 12-Page PDF Report
+// ═══════════════════════════════════════════════════════════════════════════
 import { useState, useCallback, useRef } from "react";
 import jsPDF from "jspdf";
 import autoTable from "jspdf-autotable";
-import Tesseract from "tesseract.js";
 
 // ─── Design tokens ────────────────────────────────────────────────────────────
 const C = {
-  navy: "#0c1322",
-  navy2: "#152035",
-  navy3: "#1d2d4a",
-  cream: "#f5edd6",
-  gold: "#d4a843",
-  light: "#eef0f4",
-  muted: "rgba(238,240,244,0.55)",
-  border: "rgba(212,168,67,0.20)",
-  green: "#2ecc71",
-  red: "#e74c3c",
-  blue: "#4a9eff",
+  bg:     "#080e1a",
+  navy:   "#0d1625",
+  navy2:  "#152238",
+  navy3:  "#1e3050",
+  gold:   "#c9962a",
+  goldL:  "#f0c060",
+  cream:  "#f4edd5",
+  light:  "#e8ecf2",
+  muted:  "rgba(232,236,242,0.5)",
+  border: "rgba(201,150,42,0.22)",
+  green:  "#27ae60",
+  red:    "#e74c3c",
+  blue:   "#3498db",
+  orange: "#e67e22",
 };
 
-// ─── Physical / financial constants ──────────────────────────────────────────
-const SF = 0.7; // Space Factor (Eq.1)
-const A_MODULE = 1.94; // m² per module (Jinko JKM 370M-72)
-const P_UNIT = 370.3; // Wp per module at STC
-const NOCT = 44; // °C (Eq.6)
-const GAMMA = -0.0038; // /°C temperature coefficient (Eq.7)
-const PR_INV = 0.98;
+// ─── Month helpers ────────────────────────────────────────────────────────────
+const M_S=["Jan","Fév","Mar","Avr","Mai","Jun","Jul","Aoû","Sep","Oct","Nov","Déc"];
+const M_F=["Janvier","Février","Mars","Avril","Mai","Juin","Juillet","Août","Septembre","Octobre","Novembre","Décembre"];
+const DAYS_PER_MONTH=[31,28,31,30,31,30,31,31,30,31,30,31];
+
+// ─── Physical constants ───────────────────────────────────────────────────────
+const NOCT_DEFAULT = 44;    // °C
+const GAMMA_DEFAULT = -0.0038; // /°C
+const PR_INV = 0.980;
 const PR_WIRING = 0.982;
 const PR_MISMATCH = 0.982;
 const PR_AVAIL = 0.997;
-const CO2_FACTOR = 0.55; // kg CO₂/kWh — Algerian grid
-const NM_TARIFF = 1.8064; // DA/kWh — net-metering (H.Hors Pointe)
-const TREES_TCO2 = 45;
-const VEHI_TCO2 = 2.3;
-const DAYS = [31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31];
+const SF = 0.70;            // Space factor
+const A_MODULE_PER_PITCH = 2.77; // m² with inter-row spacing at 30° tilt
+const MODULES_PER_STRING = 14;   // SMA CORE1 string size
+const CO2_FACTOR = 0.550;        // kg CO₂/kWh
+const NM_TARIFF = 1.8064;        // DA/kWh off-peak
+const DA_PER_USD = 135;
+const CUSTOMS_RATE = 0.05;       // 5% Algerian customs duty
 
-// ─── Month labels ─────────────────────────────────────────────────────────────
-const M_SHORT = [
-  "Jan",
-  "Fév",
-  "Mar",
-  "Avr",
-  "Mai",
-  "Jun",
-  "Jul",
-  "Aoû",
-  "Sep",
-  "Oct",
-  "Nov",
-  "Déc",
-];
-const M_FULL = [
-  "Janvier",
-  "Février",
-  "Mars",
-  "Avril",
-  "Mai",
-  "Juin",
-  "Juillet",
-  "Août",
-  "Septembre",
-  "Octobre",
-  "Novembre",
-  "Décembre",
-];
-
-// ─── Climate zones: monthly GHI fractions (of annual) + ambient temps ────────
-// Zone 1 — Coastal  (GHI_yr ≤ 1700)
-// Zone 2 — Tell     (1700 < GHI_yr ≤ 1950)
-// Zone 3 — Hauts-Plateaux (1950 < GHI_yr ≤ 2150)
-// Zone 4 — Pré-Saharien   (2150 < GHI_yr ≤ 2350)
-// Zone 5 — Saharien       (GHI_yr > 2350)
-type ClimateZone = 1 | 2 | 3 | 4 | 5;
-
-const ZONE_FRACS: Record<ClimateZone, number[]> = {
-  1: [
-    0.056, 0.068, 0.09, 0.1, 0.108, 0.115, 0.118, 0.106, 0.086, 0.07, 0.052,
-    0.031,
-  ],
-  2: [
-    0.05, 0.064, 0.088, 0.1, 0.108, 0.115, 0.122, 0.11, 0.086, 0.074, 0.052,
-    0.031,
-  ],
-  3: [
-    0.048, 0.063, 0.086, 0.098, 0.106, 0.115, 0.128, 0.114, 0.088, 0.076, 0.053,
-    0.025,
-  ],
-  4: [
-    0.047, 0.061, 0.085, 0.095, 0.105, 0.115, 0.132, 0.118, 0.09, 0.078, 0.054,
-    0.02,
-  ],
-  5: [
-    0.046, 0.06, 0.084, 0.093, 0.103, 0.115, 0.135, 0.12, 0.092, 0.08, 0.055,
-    0.017,
-  ],
-};
-const ZONE_TEMPS: Record<ClimateZone, number[]> = {
-  1: [12, 13, 15, 18, 21, 25, 28, 28, 24, 20, 15, 12],
-  2: [7, 9, 12, 16, 21, 27, 31, 30, 25, 19, 11, 7],
-  3: [5, 7, 11, 16, 22, 28, 33, 32, 26, 19, 10, 5],
-  4: [10, 13, 18, 23, 29, 34, 38, 37, 32, 25, 16, 10],
-  5: [13, 16, 21, 27, 33, 38, 42, 41, 36, 29, 19, 13],
-};
-// PR_soiling monthly (Eq.8) — higher in summer (Saharan dust)
-const ZONE_SOILING: Record<ClimateZone, number[]> = {
-  1: [
-    0.975, 0.975, 0.973, 0.971, 0.969, 0.966, 0.963, 0.965, 0.97, 0.973, 0.975,
-    0.975,
-  ],
-  2: [
-    0.973, 0.972, 0.97, 0.968, 0.965, 0.962, 0.96, 0.962, 0.966, 0.97, 0.972,
-    0.973,
-  ],
-  3: [
-    0.972, 0.97, 0.967, 0.964, 0.962, 0.959, 0.957, 0.959, 0.963, 0.967, 0.97,
-    0.972,
-  ],
-  4: [
-    0.97, 0.968, 0.964, 0.96, 0.958, 0.955, 0.958, 0.96, 0.964, 0.967, 0.969,
-    0.971,
-  ],
-  5: [
-    0.968, 0.965, 0.962, 0.958, 0.955, 0.953, 0.956, 0.958, 0.962, 0.965, 0.967,
-    0.969,
-  ],
-};
-
-function ghiToZone(ghi_yr: number): ClimateZone {
-  if (ghi_yr <= 1700) return 1;
-  if (ghi_yr <= 1950) return 2;
-  if (ghi_yr <= 2150) return 3;
-  if (ghi_yr <= 2350) return 4;
-  return 5;
+// ─── Panel Catalog (prices include 5% customs duty, 2025 Algeria market) ─────
+interface PanelSpec {
+  id: string; brand: string; model: string;
+  power_wp: number;       // STC power (Wp)
+  voc_stc: number;        // Open-circuit voltage at STC (V)
+  vmpp_stc: number;       // MPPT voltage at STC (V)
+  isc: number;            // Short-circuit current (A)
+  impp: number;           // MPPT current (A)
+  gamma: number;          // Temp coefficient Pmax (%/°C → as decimal e.g. -0.0038)
+  noct: number;           // °C
+  area_m2: number;        // Physical footprint
+  efficiency: number;     // %
+  warranty_yrs: number;
+  degradation_yr: number; // %/yr
+  price_dz: number;       // DA/unit (customs included)
+  technology: string;
 }
 
-// ─── 58 Wilayas (GHI in kWh/m²/year) ───────────────────────────────────────
-interface Wilaya {
-  id: number;
-  name: string;
-  ghi_yr: number;
-}
-const WILAYAS: Wilaya[] = [
-  { id: 1, name: "Adrar", ghi_yr: 2350 },
-  { id: 2, name: "Chlef", ghi_yr: 1750 },
-  { id: 3, name: "Laghouat", ghi_yr: 2150 },
-  { id: 4, name: "Oum El Bouaghi", ghi_yr: 1850 },
-  { id: 5, name: "Batna", ghi_yr: 1950 },
-  { id: 6, name: "Béjaïa", ghi_yr: 1650 },
-  { id: 7, name: "Biskra", ghi_yr: 2100 },
-  { id: 8, name: "Béchar", ghi_yr: 2300 },
-  { id: 9, name: "Blida", ghi_yr: 1700 },
-  { id: 10, name: "Bouira", ghi_yr: 1750 },
-  { id: 11, name: "Tamanrasset", ghi_yr: 2500 },
-  { id: 12, name: "Tébessa", ghi_yr: 1900 },
-  { id: 13, name: "Tlemcen", ghi_yr: 1850 },
-  { id: 14, name: "Tiaret", ghi_yr: 1900 },
-  { id: 15, name: "Tizi Ouzou", ghi_yr: 1680 },
-  { id: 16, name: "Alger", ghi_yr: 1700 },
-  { id: 17, name: "Djelfa", ghi_yr: 2050 },
-  { id: 18, name: "Jijel", ghi_yr: 1620 },
-  { id: 19, name: "Sétif", ghi_yr: 1900 },
-  { id: 20, name: "Saïda", ghi_yr: 1950 },
-  { id: 21, name: "Skikda", ghi_yr: 1600 },
-  { id: 22, name: "Sidi Bel Abbès", ghi_yr: 1880 },
-  { id: 23, name: "Annaba", ghi_yr: 1650 },
-  { id: 24, name: "Guelma", ghi_yr: 1750 },
-  { id: 25, name: "Constantine", ghi_yr: 1800 },
-  { id: 26, name: "Médéa", ghi_yr: 1820 },
-  { id: 27, name: "Mostaganem", ghi_yr: 1780 },
-  { id: 28, name: "M'Sila", ghi_yr: 2000 },
-  { id: 29, name: "Mascara", ghi_yr: 1850 },
-  { id: 30, name: "Ouargla", ghi_yr: 2300 },
-  { id: 31, name: "Oran", ghi_yr: 1820 },
-  { id: 32, name: "El Bayadh", ghi_yr: 2200 },
-  { id: 33, name: "Illizi", ghi_yr: 2450 },
-  { id: 34, name: "Bordj Bou Arréridj", ghi_yr: 1880 },
-  { id: 35, name: "Boumerdès", ghi_yr: 1680 },
-  { id: 36, name: "El Tarf", ghi_yr: 1620 },
-  { id: 37, name: "Tindouf", ghi_yr: 2400 },
-  { id: 38, name: "Tissemsilt", ghi_yr: 1800 },
-  { id: 39, name: "El Oued", ghi_yr: 2250 },
-  { id: 40, name: "Khenchela", ghi_yr: 1920 },
-  { id: 41, name: "Souk Ahras", ghi_yr: 1780 },
-  { id: 42, name: "Tipaza", ghi_yr: 1720 },
-  { id: 43, name: "Mila", ghi_yr: 1760 },
-  { id: 44, name: "Aïn Defla", ghi_yr: 1780 },
-  { id: 45, name: "Naâma", ghi_yr: 2200 },
-  { id: 46, name: "Aïn Témouchent", ghi_yr: 1850 },
-  { id: 47, name: "Ghardaïa", ghi_yr: 2250 },
-  { id: 48, name: "Relizane", ghi_yr: 1820 },
-  { id: 49, name: "El M'Ghair", ghi_yr: 2150 },
-  { id: 50, name: "El Meniaa", ghi_yr: 2300 },
-  { id: 51, name: "Ouled Djellal", ghi_yr: 2120 },
-  { id: 52, name: "Bordj Baji Mokhtar", ghi_yr: 2450 },
-  { id: 53, name: "Béni Abbès", ghi_yr: 2350 },
-  { id: 54, name: "Timimoun", ghi_yr: 2380 },
-  { id: 55, name: "Touggourt", ghi_yr: 2280 },
-  { id: 56, name: "Djanet", ghi_yr: 2480 },
-  { id: 57, name: "In Salah", ghi_yr: 2450 },
-  { id: 58, name: "In Guezzam", ghi_yr: 2500 },
+const PANEL_CATALOG: PanelSpec[] = [
+  {
+    id:"jinko_370",brand:"Jinko Solar",model:"JKM370M-72HL4",power_wp:370.3,
+    voc_stc:48.5,vmpp_stc:40.7,isc:9.65,impp:9.11,gamma:-0.0038,noct:44,
+    area_m2:1.940,efficiency:19.2,warranty_yrs:25,degradation_yr:0.5,
+    price_dz:9975,technology:"Mono PERC",
+  },
+  {
+    id:"jinko_410",brand:"Jinko Solar",model:"JKM410N-54HL4-V",power_wp:410,
+    voc_stc:37.8,vmpp_stc:31.6,isc:13.95,impp:12.98,gamma:-0.0029,noct:43,
+    area_m2:1.722,efficiency:23.8,warranty_yrs:30,degradation_yr:0.4,
+    price_dz:12600,technology:"N-Type TOPCon",
+  },
+  {
+    id:"canadian_455",brand:"Canadian Solar",model:"CS6L-455MS",power_wp:455,
+    voc_stc:49.8,vmpp_stc:42.0,isc:11.57,impp:10.84,gamma:-0.0034,noct:45,
+    area_m2:2.210,efficiency:20.6,warranty_yrs:25,degradation_yr:0.5,
+    price_dz:14700,technology:"Mono PERC",
+  },
+  {
+    id:"ja_415",brand:"JA Solar",model:"JAM54S30-415/MR",power_wp:415,
+    voc_stc:37.8,vmpp_stc:31.4,isc:14.06,impp:13.20,gamma:-0.0030,noct:43,
+    area_m2:1.752,efficiency:23.7,warranty_yrs:30,degradation_yr:0.4,
+    price_dz:12075,technology:"N-Type TOPCon",
+  },
+  {
+    id:"longi_430",brand:"LONGi",model:"LR5-54HTH-430M",power_wp:430,
+    voc_stc:37.9,vmpp_stc:31.6,isc:14.45,impp:13.62,gamma:-0.0029,noct:43,
+    area_m2:1.775,efficiency:24.2,warranty_yrs:30,degradation_yr:0.4,
+    price_dz:13650,technology:"Hi-MO 6 N-Type",
+  },
+  {
+    id:"risen_450",brand:"Risen Energy",model:"RSM144-7-450BMDG",power_wp:450,
+    voc_stc:50.4,vmpp_stc:42.2,isc:11.40,impp:10.67,gamma:-0.0034,noct:44,
+    area_m2:2.194,efficiency:20.5,warranty_yrs:25,degradation_yr:0.5,
+    price_dz:13125,technology:"Mono PERC BSMBB",
+  },
 ];
 
-// ─── Auto-sizing from gross rooftop area (Eqs 1-3 + CAPEX Eq.18) ─────────────
-function autoSize(grossArea: number, ghiYr: number) {
-  const ghi_daily = ghiYr / 365; // kWh/m²/day
-  const a_available = grossArea * SF; // Eq.1
-  const n_modules = Math.floor(a_available / A_MODULE); // Eq.2
-  const p_installed = parseFloat(((n_modules * P_UNIT) / 1000).toFixed(2)); // Eq.3 kWp
-  const n_inverters = Math.max(1, Math.ceil(p_installed / 50));
-  // Eq.18 — CAPEX estimate
-  const c_modules = n_modules * 9_500;
-  const c_inverters = n_inverters * 2_200_000;
-  const c_structure = p_installed * 4_500;
-  const c_cabling = 1_200_000;
-  const c_transform = 800_000;
-  const c_labor = p_installed * 3_500;
-  const c_eng = 650_000;
-  const subtotal =
-    c_modules +
-    c_inverters +
-    c_structure +
-    c_cabling +
-    c_transform +
-    c_labor +
-    c_eng;
-  const capex = Math.round(subtotal * 1.05);
-  return {
-    a_available,
-    n_modules,
-    p_installed,
-    n_inverters,
-    ghi_daily,
-    c_modules,
-    c_inverters,
-    c_structure,
-    c_cabling,
-    c_transform,
-    c_labor,
-    c_eng,
-    capex,
-  };
+// ─── Inverter Catalog (prices include 5% customs duty) ───────────────────────
+interface InverterSpec {
+  id: string; brand: string; model: string;
+  power_kw: number;        // AC output (kW)
+  max_dc_v: number;        // Max DC input voltage (V)
+  mppt_min_v: number;
+  mppt_max_v: number;
+  max_isc_per_mppt: number;
+  n_mppt: number;
+  efficiency: number;      // %
+  warranty_yrs: number;
+  price_dz: number;        // DA/unit (customs included)
 }
+
+const INVERTER_CATALOG: InverterSpec[] = [
+  {
+    id:"sma_50",brand:"SMA",model:"Sunny Tripower CORE1 STP 50-40",
+    power_kw:50,max_dc_v:1000,mppt_min_v:500,mppt_max_v:800,
+    max_isc_per_mppt:33,n_mppt:6,efficiency:98.4,warranty_yrs:10,
+    price_dz:1417500,
+  },
+  {
+    id:"sma_60",brand:"SMA",model:"Sunny Tripower STP 60-10",
+    power_kw:60,max_dc_v:1000,mppt_min_v:390,mppt_max_v:800,
+    max_isc_per_mppt:33,n_mppt:3,efficiency:98.4,warranty_yrs:10,
+    price_dz:1701000,
+  },
+  {
+    id:"huawei_50",brand:"Huawei",model:"SUN2000-50KTL-M3",
+    power_kw:50,max_dc_v:1100,mppt_min_v:200,mppt_max_v:1000,
+    max_isc_per_mppt:30,n_mppt:6,efficiency:98.8,warranty_yrs:10,
+    price_dz:1260000,
+  },
+  {
+    id:"huawei_60",brand:"Huawei",model:"SUN2000-60KTL-M0",
+    power_kw:60,max_dc_v:1100,mppt_min_v:200,mppt_max_v:1000,
+    max_isc_per_mppt:30,n_mppt:4,efficiency:98.8,warranty_yrs:10,
+    price_dz:1512000,
+  },
+  {
+    id:"growatt_50",brand:"Growatt",model:"MAX 50KTL3 LV",
+    power_kw:50,max_dc_v:1000,mppt_min_v:200,mppt_max_v:800,
+    max_isc_per_mppt:25,n_mppt:6,efficiency:98.6,warranty_yrs:10,
+    price_dz:1029000,
+  },
+  {
+    id:"fronius_50",brand:"Fronius",model:"Symo Advanced 50.0-3-S",
+    power_kw:50,max_dc_v:1000,mppt_min_v:200,mppt_max_v:800,
+    max_isc_per_mppt:27,n_mppt:2,efficiency:98.5,warranty_yrs:10,
+    price_dz:1764000,
+  },
+];
+
+// ─── Wilaya database (48 wilayas, monthly GHI + temps) ───────────────────────
+interface WilayaData {
+  id:number; name_fr:string; name_ar:string; ghi_annual:number;
+  pr_soiling_base:number; latitude:number;
+  ghi_monthly:number[]; temp_monthly:number[];
+}
+
+const WILAYAS: WilayaData[] = [
+  {id:1,name_fr:"Adrar",name_ar:"أدرار",ghi_annual:6.50,pr_soiling_base:0.970,latitude:27.9,ghi_monthly:[5.40,6.10,6.80,7.40,7.80,8.00,7.80,7.70,7.30,6.70,5.80,5.20],temp_monthly:[17,20,26,31,37,42,44,43,38,31,22,17]},
+  {id:2,name_fr:"Chlef",name_ar:"الشلف",ghi_annual:5.15,pr_soiling_base:0.975,latitude:36.2,ghi_monthly:[3.80,4.50,5.30,6.00,6.70,7.20,7.30,7.00,5.90,4.90,3.90,3.40],temp_monthly:[10,12,14,17,21,26,30,29,24,19,13,10]},
+  {id:3,name_fr:"Laghouat",name_ar:"الأغواط",ghi_annual:5.80,pr_soiling_base:0.970,latitude:33.8,ghi_monthly:[4.20,5.00,5.90,6.60,7.30,7.80,7.90,7.60,6.50,5.50,4.30,3.80],temp_monthly:[8,10,15,20,25,32,36,35,29,21,13,8]},
+  {id:4,name_fr:"Oum El Bouaghi",name_ar:"أم البواقي",ghi_annual:5.25,pr_soiling_base:0.975,latitude:35.9,ghi_monthly:[3.80,4.50,5.30,6.00,6.70,7.20,7.30,7.00,5.90,4.90,3.90,3.40],temp_monthly:[5,7,10,14,18,24,27,27,22,16,10,6]},
+  {id:5,name_fr:"Batna",name_ar:"باتنة",ghi_annual:5.35,pr_soiling_base:0.970,latitude:35.6,ghi_monthly:[3.90,4.60,5.40,6.10,6.80,7.30,7.40,7.10,6.00,5.00,4.00,3.50],temp_monthly:[4,6,9,14,18,24,27,27,22,16,9,5]},
+  {id:6,name_fr:"Béjaïa",name_ar:"بجاية",ghi_annual:4.85,pr_soiling_base:0.975,latitude:36.8,ghi_monthly:[3.40,4.10,4.90,5.60,6.20,6.90,7.00,6.70,5.50,4.40,3.50,3.00],temp_monthly:[11,12,14,17,21,25,28,28,24,19,14,11]},
+  {id:7,name_fr:"Biskra",name_ar:"بسكرة",ghi_annual:5.50,pr_soiling_base:0.970,latitude:34.8,ghi_monthly:[3.80,4.60,5.50,6.00,6.80,7.10,7.20,6.90,5.90,5.10,3.90,3.50],temp_monthly:[11,13,17,22,28,33,37,36,30,23,15,11]},
+  {id:8,name_fr:"Béchar",name_ar:"بشار",ghi_annual:6.10,pr_soiling_base:0.970,latitude:31.6,ghi_monthly:[4.60,5.40,6.30,7.00,7.70,8.10,8.00,7.80,6.80,5.90,4.70,4.20],temp_monthly:[10,13,18,23,29,35,39,38,32,24,15,10]},
+  {id:9,name_fr:"Blida",name_ar:"البليدة",ghi_annual:5.05,pr_soiling_base:0.975,latitude:36.5,ghi_monthly:[3.65,4.35,5.15,5.85,6.55,7.15,7.25,6.95,5.75,4.65,3.75,3.25],temp_monthly:[11,12,15,18,22,26,29,29,25,20,15,11]},
+  {id:10,name_fr:"Bouira",name_ar:"البويرة",ghi_annual:5.05,pr_soiling_base:0.975,latitude:36.4,ghi_monthly:[3.60,4.30,5.10,5.80,6.50,7.00,7.10,6.80,5.70,4.70,3.70,3.20],temp_monthly:[7,8,11,15,19,24,27,27,22,17,11,7]},
+  {id:11,name_fr:"Tamanrasset",name_ar:"تمنراست",ghi_annual:6.80,pr_soiling_base:0.970,latitude:22.8,ghi_monthly:[6.10,6.50,7.00,7.50,7.80,7.90,7.60,7.30,7.10,6.80,6.30,5.90],temp_monthly:[14,17,22,27,32,36,38,37,33,27,19,14]},
+  {id:12,name_fr:"Tébessa",name_ar:"تبسة",ghi_annual:5.35,pr_soiling_base:0.970,latitude:35.4,ghi_monthly:[3.90,4.60,5.40,6.10,6.80,7.30,7.40,7.10,6.00,5.00,4.00,3.50],temp_monthly:[5,7,10,15,19,25,28,28,23,16,10,6]},
+  {id:13,name_fr:"Tlemcen",name_ar:"تلمسان",ghi_annual:5.25,pr_soiling_base:0.975,latitude:34.9,ghi_monthly:[3.90,4.60,5.40,6.10,6.80,7.30,7.40,7.10,6.00,5.00,4.00,3.50],temp_monthly:[9,11,13,16,20,25,29,28,24,18,13,9]},
+  {id:14,name_fr:"Tiaret",name_ar:"تيارت",ghi_annual:5.45,pr_soiling_base:0.970,latitude:35.4,ghi_monthly:[3.90,4.70,5.60,6.30,7.00,7.50,7.60,7.30,6.20,5.20,4.00,3.50],temp_monthly:[7,9,12,16,20,26,30,29,24,18,12,7]},
+  {id:15,name_fr:"Tizi Ouzou",name_ar:"تيزي وزو",ghi_annual:4.90,pr_soiling_base:0.975,latitude:36.7,ghi_monthly:[3.50,4.20,5.00,5.70,6.30,6.90,7.00,6.70,5.50,4.50,3.60,3.10],temp_monthly:[8,9,12,15,19,24,27,27,23,18,12,9]},
+  {id:16,name_fr:"Alger",name_ar:"الجزائر",ghi_annual:5.02,pr_soiling_base:0.975,latitude:36.7,ghi_monthly:[3.60,4.30,5.10,5.80,6.50,7.10,7.20,6.90,5.70,4.60,3.70,3.20],temp_monthly:[12,13,15,18,22,26,29,29,25,20,15,12]},
+  {id:17,name_fr:"Djelfa",name_ar:"الجلفة",ghi_annual:5.60,pr_soiling_base:0.970,latitude:34.7,ghi_monthly:[4.00,4.80,5.70,6.40,7.10,7.60,7.70,7.40,6.30,5.30,4.10,3.60],temp_monthly:[5,7,11,16,21,28,32,31,25,18,10,6]},
+  {id:18,name_fr:"Jijel",name_ar:"جيجل",ghi_annual:4.80,pr_soiling_base:0.975,latitude:36.8,ghi_monthly:[3.30,4.00,4.80,5.50,6.10,6.80,6.90,6.60,5.40,4.30,3.40,2.90],temp_monthly:[11,12,14,17,20,24,27,27,24,19,14,11]},
+  {id:19,name_fr:"Sétif",name_ar:"سطيف",ghi_annual:5.30,pr_soiling_base:0.975,latitude:36.2,ghi_monthly:[3.80,4.50,5.30,6.00,6.70,7.20,7.30,7.00,5.90,4.90,3.90,3.40],temp_monthly:[5,7,10,14,18,24,27,27,22,16,10,6]},
+  {id:20,name_fr:"Saïda",name_ar:"سعيدة",ghi_annual:5.40,pr_soiling_base:0.970,latitude:34.8,ghi_monthly:[3.90,4.70,5.60,6.30,7.00,7.50,7.60,7.30,6.20,5.20,4.00,3.50],temp_monthly:[8,10,13,16,21,26,30,29,24,19,12,8]},
+  {id:21,name_fr:"Skikda",name_ar:"سكيكدة",ghi_annual:4.88,pr_soiling_base:0.975,latitude:36.9,ghi_monthly:[3.40,4.10,4.90,5.60,6.20,6.90,7.00,6.70,5.50,4.40,3.50,3.00],temp_monthly:[12,13,15,17,21,25,27,27,24,20,15,12]},
+  {id:22,name_fr:"Sidi Bel Abbès",name_ar:"سيدي بلعباس",ghi_annual:5.15,pr_soiling_base:0.975,latitude:35.2,ghi_monthly:[3.80,4.50,5.30,6.00,6.70,7.20,7.30,7.00,5.90,4.90,3.90,3.40],temp_monthly:[9,11,14,17,21,26,30,29,24,19,13,9]},
+  {id:23,name_fr:"Annaba",name_ar:"عنابة",ghi_annual:4.90,pr_soiling_base:0.975,latitude:36.9,ghi_monthly:[3.50,4.20,5.00,5.70,6.30,7.00,7.10,6.80,5.60,4.50,3.60,3.10],temp_monthly:[12,13,15,18,22,26,28,28,25,20,15,12]},
+  {id:24,name_fr:"Guelma",name_ar:"قالمة",ghi_annual:5.10,pr_soiling_base:0.975,latitude:36.5,ghi_monthly:[3.60,4.30,5.10,5.80,6.50,7.00,7.10,6.80,5.70,4.70,3.70,3.20],temp_monthly:[7,9,12,15,20,25,28,28,23,18,12,8]},
+  {id:25,name_fr:"Constantine",name_ar:"قسنطينة",ghi_annual:5.20,pr_soiling_base:0.975,latitude:36.4,ghi_monthly:[3.70,4.40,5.20,5.90,6.60,7.10,7.20,6.90,5.80,4.80,3.80,3.30],temp_monthly:[6,8,11,15,19,25,28,28,23,17,11,7]},
+  {id:26,name_fr:"Médéa",name_ar:"المدية",ghi_annual:5.10,pr_soiling_base:0.975,latitude:36.3,ghi_monthly:[3.65,4.35,5.15,5.85,6.55,7.05,7.15,6.85,5.75,4.65,3.75,3.25],temp_monthly:[8,9,12,15,19,24,27,27,23,17,12,8]},
+  {id:27,name_fr:"Mostaganem",name_ar:"مستغانم",ghi_annual:5.05,pr_soiling_base:0.975,latitude:35.9,ghi_monthly:[3.70,4.40,5.20,5.90,6.60,7.20,7.30,7.00,5.80,4.70,3.80,3.30],temp_monthly:[12,13,15,17,21,25,28,28,24,20,15,12]},
+  {id:28,name_fr:"M'Sila",name_ar:"المسيلة",ghi_annual:5.50,pr_soiling_base:0.970,latitude:35.7,ghi_monthly:[3.90,4.70,5.60,6.30,7.00,7.50,7.60,7.30,6.20,5.20,4.00,3.50],temp_monthly:[7,9,13,18,23,29,33,32,27,20,12,7]},
+  {id:29,name_fr:"Mascara",name_ar:"معسكر",ghi_annual:5.20,pr_soiling_base:0.975,latitude:35.4,ghi_monthly:[3.80,4.50,5.30,6.00,6.70,7.20,7.30,7.00,5.90,4.90,3.90,3.40],temp_monthly:[10,12,14,17,21,26,30,29,25,19,13,10]},
+  {id:30,name_fr:"Ouargla",name_ar:"ورقلة",ghi_annual:6.20,pr_soiling_base:0.970,latitude:31.9,ghi_monthly:[4.70,5.50,6.40,7.10,7.80,8.20,8.10,7.90,6.90,6.00,4.80,4.30],temp_monthly:[12,15,20,25,31,37,41,40,34,26,17,12]},
+  {id:31,name_fr:"Oran",name_ar:"وهران",ghi_annual:5.05,pr_soiling_base:0.975,latitude:35.7,ghi_monthly:[3.70,4.40,5.20,5.90,6.60,7.20,7.30,7.00,5.80,4.70,3.80,3.30],temp_monthly:[12,13,15,17,21,25,28,28,24,20,15,12]},
+  {id:32,name_fr:"El Bayadh",name_ar:"البيض",ghi_annual:5.75,pr_soiling_base:0.970,latitude:33.7,ghi_monthly:[4.10,4.90,5.80,6.50,7.20,7.70,7.80,7.50,6.40,5.40,4.20,3.70],temp_monthly:[6,8,13,18,23,30,34,33,27,20,11,6]},
+  {id:33,name_fr:"Illizi",name_ar:"إليزي",ghi_annual:6.50,pr_soiling_base:0.970,latitude:26.5,ghi_monthly:[5.40,6.10,6.80,7.40,7.80,7.90,7.70,7.60,7.30,6.70,5.80,5.20],temp_monthly:[15,18,23,28,34,38,41,40,35,28,20,15]},
+  {id:34,name_fr:"Bordj Bou Arréridj",name_ar:"برج بوعريريج",ghi_annual:5.25,pr_soiling_base:0.975,latitude:36.1,ghi_monthly:[3.80,4.50,5.30,6.00,6.70,7.20,7.30,7.00,5.90,4.90,3.90,3.40],temp_monthly:[6,8,11,15,19,24,28,27,22,17,10,6]},
+  {id:35,name_fr:"Boumerdès",name_ar:"بومرداس",ghi_annual:4.95,pr_soiling_base:0.975,latitude:36.8,ghi_monthly:[3.55,4.25,5.05,5.75,6.45,7.05,7.15,6.85,5.65,4.55,3.65,3.15],temp_monthly:[12,13,15,18,22,26,29,29,25,20,15,12]},
+  {id:36,name_fr:"El Tarf",name_ar:"الطارف",ghi_annual:4.95,pr_soiling_base:0.975,latitude:36.8,ghi_monthly:[3.50,4.20,5.00,5.70,6.30,6.90,7.00,6.70,5.55,4.45,3.55,3.05],temp_monthly:[10,11,14,17,21,25,27,27,24,19,14,11]},
+  {id:37,name_fr:"Tindouf",name_ar:"تندوف",ghi_annual:6.60,pr_soiling_base:0.970,latitude:27.7,ghi_monthly:[5.50,6.20,6.90,7.50,7.90,8.00,7.80,7.70,7.40,6.80,5.90,5.30],temp_monthly:[14,17,22,28,33,38,42,41,36,28,19,14]},
+  {id:38,name_fr:"Tissemsilt",name_ar:"تيسمسيلت",ghi_annual:5.20,pr_soiling_base:0.975,latitude:35.6,ghi_monthly:[3.80,4.50,5.30,6.00,6.70,7.20,7.30,7.00,5.90,4.90,3.90,3.40],temp_monthly:[8,10,13,16,20,25,29,28,23,18,12,8]},
+  {id:39,name_fr:"El Oued",name_ar:"الوادي",ghi_annual:6.10,pr_soiling_base:0.970,latitude:33.4,ghi_monthly:[4.60,5.40,6.30,7.00,7.70,8.10,8.00,7.80,6.80,5.90,4.70,4.20],temp_monthly:[11,14,18,24,30,36,40,39,33,25,16,11]},
+  {id:40,name_fr:"Khenchela",name_ar:"خنشلة",ghi_annual:5.40,pr_soiling_base:0.970,latitude:35.4,ghi_monthly:[3.90,4.70,5.60,6.30,7.00,7.50,7.60,7.30,6.20,5.20,4.00,3.50],temp_monthly:[4,6,9,14,18,25,28,28,22,16,9,5]},
+  {id:41,name_fr:"Souk Ahras",name_ar:"سوق أهراس",ghi_annual:5.10,pr_soiling_base:0.975,latitude:36.3,ghi_monthly:[3.60,4.30,5.10,5.80,6.50,7.00,7.10,6.80,5.70,4.70,3.70,3.20],temp_monthly:[7,9,12,15,20,25,28,28,23,18,12,8]},
+  {id:42,name_fr:"Tipaza",name_ar:"تيبازة",ghi_annual:5.00,pr_soiling_base:0.975,latitude:36.6,ghi_monthly:[3.60,4.30,5.10,5.80,6.50,7.10,7.20,6.90,5.70,4.60,3.70,3.20],temp_monthly:[12,13,15,18,22,26,29,29,25,20,15,12]},
+  {id:43,name_fr:"Mila",name_ar:"ميلة",ghi_annual:5.20,pr_soiling_base:0.975,latitude:36.5,ghi_monthly:[3.70,4.40,5.20,5.90,6.60,7.10,7.20,6.90,5.80,4.80,3.80,3.30],temp_monthly:[6,8,11,15,19,25,28,28,23,17,11,7]},
+  {id:44,name_fr:"Aïn Defla",name_ar:"عين الدفلى",ghi_annual:5.10,pr_soiling_base:0.975,latitude:36.3,ghi_monthly:[3.65,4.35,5.15,5.85,6.55,7.05,7.15,6.85,5.75,4.65,3.75,3.25],temp_monthly:[10,11,14,17,21,26,29,29,24,19,13,10]},
+  {id:45,name_fr:"Naâma",name_ar:"النعامة",ghi_annual:5.70,pr_soiling_base:0.970,latitude:33.3,ghi_monthly:[4.10,4.90,5.80,6.50,7.20,7.70,7.80,7.50,6.40,5.40,4.20,3.70],temp_monthly:[7,9,13,18,23,29,34,33,27,20,12,7]},
+  {id:46,name_fr:"Aïn Témouchent",name_ar:"عين تموشنت",ghi_annual:5.05,pr_soiling_base:0.975,latitude:35.3,ghi_monthly:[3.70,4.40,5.20,5.90,6.60,7.20,7.30,7.00,5.80,4.70,3.80,3.30],temp_monthly:[12,13,15,17,21,25,28,28,24,20,15,12]},
+  {id:47,name_fr:"Ghardaïa",name_ar:"غرداية",ghi_annual:6.00,pr_soiling_base:0.970,latitude:32.5,ghi_monthly:[4.50,5.30,6.20,6.90,7.60,8.00,7.90,7.70,6.70,5.80,4.60,4.10],temp_monthly:[11,13,18,23,29,35,39,38,32,25,16,11]},
+  {id:48,name_fr:"Relizane",name_ar:"غليزان",ghi_annual:5.10,pr_soiling_base:0.975,latitude:35.7,ghi_monthly:[3.70,4.40,5.20,5.90,6.60,7.10,7.20,6.90,5.80,4.80,3.80,3.30],temp_monthly:[10,12,14,17,21,26,30,29,24,19,13,10]},
+];
 
 // ─── Interfaces ───────────────────────────────────────────────────────────────
 interface LocationParams {
-  wilaya_id: number;
-  building_name: string;
-  building_address: string;
-  gross_area: number; // m²
+  wilaya_id:number; institution_name:string; institution_type:string;
+  address:string; gross_area:number; n_buildings:number;
+  tilt:number; orientation:string; cleaning_freq:string;
 }
-interface BillData {
-  hp_kwh: number;
-  peak_kwh: number;
-  total_da: number;
-  month: number;
-  year: number;
+interface EquipmentParams {
+  panel_id:string; inverter_id:string;
 }
-interface BillSlot {
-  file: File | null;
-  preview: string | null;
-  status: "empty" | "processing" | "done";
-  data: BillData | null;
-  edited: BillData | null;
-  ocrWarn: string;
+interface InvoiceData {
+  billing_period:string; h_pointe_kwh:number; peak_kwh:number;
+  total_kwh:number; invoice_da:number; eff_tariff:number;
 }
-interface SystemParams {
-  p_installed: number;
-  n_modules: number;
-  n_inverters: number;
-  module_brand: string;
-  module_model: string;
-  module_power: number;
-  inverter_brand: string;
-  tilt: number;
-  orientation: string;
-  pr: number;
-  a_available: number;
-  c_modules: number;
-  c_inverters: number;
-  c_structure: number;
-  c_cabling: number;
-  c_transform: number;
-  c_labor: number;
-  c_eng: number;
+interface InvoiceSlot {
+  file:File|null; preview:string|null;
+  status:"empty"|"processing"|"done"|"error";
+  data:InvoiceData|null; edited:InvoiceData|null; warn:string;
 }
 interface FinancialParams {
-  r: number;
-  f: number;
-  D: number;
-  om_rate: number;
-  DS: number;
-  subsidy_rate: number;
+  r:number; f:number; D:number; om_rate:number; DS:number;
+  subsidy_rate:number; loan_rate:number; loan_years:number; loan_down:number;
+}
+interface SizingResult {
+  a_available:number; n_modules_max:number; n_strings:number;
+  n_modules:number; p_installed:number; n_inverters:number;
+  dc_ac_ratio:number; c_transformer_kva:number;
+  area_occupied:number;
 }
 interface MonthlyDetail {
-  m: number;
-  ghi_daily: number;
-  t_amb: number;
-  t_cell: number;
-  pr_temp: number;
-  pr_soiling: number;
-  pr_total: number;
-  e_pv: number;
-  e_cons: number;
-  sc: number;
-  exported_m: number;
-  scr_m: number;
+  m:number; ghi_d:number; t_amb:number; t_cell:number; pr_temp:number;
+  pr_soiling:number; pr_total:number; e_pv:number;
+  e_cons:number; e_sc:number; e_export:number; e_grid:number; scr_m:number;
 }
 interface DCFRow {
-  year: number;
-  e_self_n: number;
-  t_n: number;
-  energy_savings: number;
-  ds: number;
-  gross_savings: number;
-  om: number;
-  net_cf: number;
-  dcf: number;
-  cum_sc1: number;
-  cum_sc2: number;
+  year:number; e_self_n:number; t_n:number; energy_sav:number; ds:number;
+  gross_sav:number; om:number; inv_repl:number; net_cf:number; dcf:number;
+  cum_sc1:number; cum_sc2:number; cum_sc3:number;
+  net_cf_sc3:number;
 }
+interface SensRow { label:string; npv:number; spp:number; }
 interface StudyResults {
-  // Sizing
-  a_available: number;
-  // Production (Eqs 4-9)
-  e_annual: number;
-  fleh: number;
-  monthly: MonthlyDetail[];
-  monthly_pv: number[];
-  monthly_cons: number[];
-  monthly_sc: number[];
-  monthly_scr: number[];
-  // SCR (Eqs 13-17)
-  scr: number;
-  e_self_yr1: number;
-  exported: number;
-  ssr: number;
-  // Invoices (Eqs 10-12)
-  t0: number;
-  total_da: number;
-  total_kwh: number;
-  // Financials (Eqs 20-32)
-  capex: number;
-  capex_sc2: number;
-  om_annual: number;
-  yr1_energy_savings: number;
-  yr1_gross_savings: number;
-  yr1_net_cf: number;
-  spp_sc1: number;
-  spp_sc2: number;
-  npv_sc1: number;
-  npv_sc2: number;
-  irr_sc1: number;
-  irr_sc2: number;
-  dpp_sc1: number | null;
-  dpp_sc2: number | null;
-  pi_sc1: number;
-  pi_sc2: number;
-  lcoe: number;
-  dcf_table: DCFRow[];
-  // Environmental (Eqs 33-35)
-  co2_yr1: number;
-  co2_25yr: number;
-  nm_revenue: number;
-  trees_equiv: number;
-  vehicles_equiv: number;
+  sizing:SizingResult;
+  monthly:MonthlyDetail[];
+  e_annual:number; fleh:number;
+  monthly_pv:number[]; monthly_cons:number[]; monthly_sc:number[]; monthly_scr:number[];
+  scr_annual:number; e_self_yr1:number; e_surplus:number; ssr:number;
+  t0:number; peak_fraction:number; total_da:number; total_kwh:number;
+  capex:number; capex_sc2:number; capex_breakdown:{label:string;val:number}[];
+  cost_per_wp:number; inv_replacement:number;
+  om_annual:number; yr1_energy_sav:number; yr1_gross_sav:number; yr1_net_cf:number;
+  spp_sc1:number; spp_sc2:number;
+  npv_sc1:number; npv_sc2:number; npv_sc3:number;
+  irr_sc1:number; irr_sc2:number; irr_sc3:number;
+  dpp_sc1:number|null; dpp_sc2:number|null; dpp_sc3:number|null;
+  pi_sc1:number; pi_sc2:number; pi_sc3:number;
+  lcoe:number; nm_revenue:number; npv_nm:number;
+  co2_yr1:number; co2_25yr:number; trees_yr:number; vehi_yr:number; gas_yr:number;
+  dcf_table:DCFRow[];
+  sens_scr:SensRow[]; sens_ghi:SensRow[]; sens_om:SensRow[];
+  be_scr:number; be_tariff:number;
+  warnings:string[];
 }
 
-// ─── IRR bisection ─────────────────────────────────────────────────────────────
-function calcIRR(cashflows: number[], investment: number): number {
-  const npv = (r: number) =>
-    cashflows.reduce(
-      (acc, cf, i) => acc + cf / Math.pow(1 + r, i + 1),
-      -investment,
-    );
-  if (npv(0.001) <= 0) return 0;
-  let lo = 0.001,
-    hi = 3.0;
-  if (npv(hi) > 0) return hi;
-  for (let i = 0; i < 300; i++) {
-    const mid = (lo + hi) / 2;
-    npv(mid) > 0 ? (lo = mid) : (hi = mid);
-  }
-  return (lo + hi) / 2;
+// ─── IRR solver ───────────────────────────────────────────────────────────────
+function solveIRR(cfs:number[], inv:number): number {
+  const npv=(r:number)=>cfs.reduce((acc,cf,i)=>acc+cf/Math.pow(1+r,i+1),-inv);
+  if(npv(0.001)<=0) return 0;
+  let lo=0.001,hi=3.0;
+  if(npv(hi)>0) return hi;
+  for(let i=0;i<300;i++){const mid=(lo+hi)/2; npv(mid)>0?(lo=mid):(hi=mid);}
+  return (lo+hi)/2;
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
-//  MAIN CALCULATION ENGINE — All 35 Equations
-// ─────────────────────────────────────────────────────────────────────────────
+// ─── PR Soiling from cleaning freq ───────────────────────────────────────────
+function prSoiling(base:number, freq:string): number {
+  if(freq==="monthly") return 0.977;
+  if(freq==="quarterly") return 0.963;
+  if(freq==="annual") return 0.950;
+  return base; // bi-monthly default
+}
+
+// ─── DS default by institution type ─────────────────────────────────────────
+function dsDefault(type:string): number {
+  if(type==="hospital") return 180000;
+  if(type==="admin") return 90000;
+  return 120000; // university/school/other
+}
+
+// ══════════════════════════════════════════════════════════════════════════════
+//  ALL 55 EQUATIONS — MAIN CALCULATION ENGINE
+// ══════════════════════════════════════════════════════════════════════════════
 function runStudy(
-  loc: LocationParams,
-  bills: BillSlot[],
-  sys: SystemParams,
-  fin: FinancialParams,
+  loc: LocationParams, eq: EquipmentParams,
+  invoices: InvoiceSlot[], fin: FinancialParams
 ): StudyResults {
-  const wilaya = WILAYAS.find((w) => w.id === loc.wilaya_id) ?? WILAYAS[6];
-  const zone = ghiToZone(wilaya.ghi_yr);
-  const ghi_yr = wilaya.ghi_yr;
-  const ghi_day = ghi_yr / 365; // kWh/m²/day
-  const fracs = ZONE_FRACS[zone];
-  const t_ambs = ZONE_TEMPS[zone];
-  const soilings = ZONE_SOILING[zone];
-  const a_avail = parseFloat((loc.gross_area * SF).toFixed(2)); // Eq.1
+  const warns:string[] = [];
+  const wilaya = WILAYAS.find(w=>w.id===loc.wilaya_id) ?? WILAYAS[6];
+  const panel  = PANEL_CATALOG.find(p=>p.id===eq.panel_id) ?? PANEL_CATALOG[0];
+  const inv    = INVERTER_CATALOG.find(i=>i.id===eq.inverter_id) ?? INVERTER_CATALOG[0];
+  const soiling= prSoiling(wilaya.pr_soiling_base, loc.cleaning_freq);
 
-  // ── Eqs 4-5: Annual production ─────────────────────────────────────────────
-  const pr_base = sys.pr / 100;
-  const e_annual = sys.p_installed * ghi_day * pr_base * 365; // Eq.4
-  const fleh = e_annual / sys.p_installed; // Eq.5
+  // ── GROUP A: System Sizing (Eq 1-8) ────────────────────────────────────────
+  const a_available   = +(loc.gross_area * SF).toFixed(2);                          // Eq.1
+  const n_modules_max = Math.floor(a_available / A_MODULE_PER_PITCH);               // Eq.2
+  let   n_strings     = Math.floor(n_modules_max / MODULES_PER_STRING);             // Eq.3
+  let   n_modules     = n_strings * MODULES_PER_STRING;                             // Eq.4
+  let   p_installed   = +(n_modules * panel.power_wp / 1000).toFixed(2);            // Eq.5
+  let   n_inverters   = Math.max(1, Math.ceil(p_installed / inv.power_kw));         // Eq.6
+  let   dc_ac         = +(p_installed / (n_inverters * inv.power_kw)).toFixed(3);   // Eq.7
 
-  // ── Eqs 6-9: Monthly production with temperature-corrected PR ──────────────
-  const monthly_detail: MonthlyDetail[] = [];
-  const monthly_pv: number[] = [];
+  // Eq.8 — validation loop
+  if(dc_ac < 1.05 && n_inverters > 1){ n_inverters--; dc_ac=+(p_installed/(n_inverters*inv.power_kw)).toFixed(3); }
+  if(dc_ac > 1.30){ n_inverters++; dc_ac=+(p_installed/(n_inverters*inv.power_kw)).toFixed(3); }
+  if(dc_ac > 1.30 || dc_ac < 1.05) warns.push(`DC/AC ratio ${dc_ac} outside [1.05–1.30] — system requires custom design.`);
+  if(n_modules < 14) warns.push("Roof too small for minimum 1 string (14 modules). Min ~55 m² gross.");
+  if(n_modules > 2000) warns.push("Very large system. Verify roof area measurement.");
+  const c_transformer_kva = Math.ceil(n_inverters * inv.power_kw / 0.90);           // Eq.8 transformer
+  const area_occupied = n_modules * A_MODULE_PER_PITCH;
+  const sizing:SizingResult = {a_available,n_modules_max,n_strings,n_modules,p_installed,n_inverters,dc_ac_ratio:dc_ac,c_transformer_kva,area_occupied};
 
-  for (let m = 0; m < 12; m++) {
-    const ghi_m_daily = ghi_day * fracs[m] * 12; // daily avg for month
-    const t_amb = t_ambs[m];
-    const t_cell = t_amb + ((NOCT - 20) * ghi_m_daily) / 0.8; // Eq.6
-    const pr_temp = 1 + GAMMA * (t_cell - 25); // Eq.7
-    const pr_soiling = soilings[m];
-    const pr_total =
-      pr_temp * pr_soiling * PR_INV * PR_WIRING * PR_MISMATCH * PR_AVAIL; // Eq.8
-    const ghi_m_total = ghi_yr * fracs[m]; // total kWh/m² for month
-    const e_pv = Math.round(sys.p_installed * ghi_m_total * pr_total); // Eq.9
+  // ── GROUP B: Energy Production (Eq 9-17) ──────────────────────────────────
+  const monthly_detail:MonthlyDetail[] = [];
+  const monthly_pv:number[] = [];
+
+  for(let m=0;m<12;m++){
+    const ghi_d  = wilaya.ghi_monthly[m];                                      // kWh/m²/day
+    const t_amb  = wilaya.temp_monthly[m];
+    const t_cell = t_amb + (panel.noct - 20) * ghi_d / 0.8;                   // Eq.9
+    const pr_temp= 1 + panel.gamma * (t_cell - 25);                            // Eq.10
+    const pr_tot = pr_temp * soiling * PR_INV * PR_WIRING * PR_MISMATCH * PR_AVAIL; // Eq.12
+    const e_pv   = Math.round(p_installed * ghi_d * pr_tot * DAYS_PER_MONTH[m]); // Eq.13
     monthly_pv.push(e_pv);
-    monthly_detail.push({
-      m,
-      ghi_daily: parseFloat(ghi_m_daily.toFixed(3)),
-      t_amb,
-      t_cell: parseFloat(t_cell.toFixed(1)),
-      pr_temp: parseFloat((pr_temp * 100).toFixed(1)),
-      pr_soiling,
-      pr_total: parseFloat((pr_total * 100).toFixed(1)),
-      e_pv,
-      e_cons: 0,
-      sc: 0,
-      exported_m: 0,
-      scr_m: 0,
-    });
+    monthly_detail.push({m,ghi_d,t_amb,t_cell:+t_cell.toFixed(1),
+      pr_temp:+(pr_temp*100).toFixed(1),pr_soiling:soiling,pr_total:+(pr_tot*100).toFixed(1),
+      e_pv,e_cons:0,e_sc:0,e_export:0,e_grid:0,scr_m:0});
   }
+  const e_annual = monthly_pv.reduce((a,b)=>a+b,0);                             // Eq.14
+  const fleh = +(e_annual / p_installed).toFixed(0);                             // Eq.16
+  if(fleh < 1400) warns.push(`FLEH = ${fleh} h/yr is below expected minimum (1400). Check GHI data.`);
+  if(fleh > 2300) warns.push(`FLEH = ${fleh} h/yr is above expected maximum (2300). Check GHI data.`);
 
-  // ── Eqs 10-12: Invoice analysis ────────────────────────────────────────────
-  const monthly_cons = new Array(12).fill(0);
-  let total_da = 0,
-    total_kwh = 0;
-  bills
-    .filter(
-      (b) =>
-        b.status === "done" && b.edited !== null && (b.edited.month ?? 0) >= 1,
-    )
-    .forEach((b) => {
-      const d = b.edited!;
-      const idx = d.month - 1;
-      if (idx < 0 || idx > 11) return;
-      const cons = (d.hp_kwh || 0) + (d.peak_kwh || 0);
-      monthly_cons[idx] = Math.max(monthly_cons[idx], cons); // Eq.11
-      total_da += d.total_da || 0;
-      total_kwh += cons;
-    });
-  const filled = monthly_cons.filter((v) => v > 0);
-  const avgCons =
-    filled.length > 0
-      ? filled.reduce((a, b) => a + b, 0) / filled.length
-      : 10000;
-  const monthly_cons_f = monthly_cons.map((v) => (v > 0 ? v : avgCons));
-  const t0 = total_kwh > 0 ? total_da / total_kwh : 4.8018; // Eq.10 (weighted tariff)
+  // ── GROUP C: Consumption & Tariff (Eq 18-23) ──────────────────────────────
+  // Multi-year averaging (Eq.18)
+  const byMonth: {[key:string]:{kwh:number[],da:number[]}} = {};
+  for(let m=0;m<12;m++) byMonth[String(m)] = {kwh:[],da:[]};
+  invoices.filter(s=>s.status==="done"&&s.edited).forEach(s=>{
+    const d=s.edited!;
+    const period = d.billing_period ?? "";
+    const mIdx = period ? (parseInt(period.split("-")[1])-1) : -1;
+    if(mIdx<0||mIdx>11) return;
+    if(d.total_kwh>0) byMonth[mIdx].kwh.push(d.total_kwh);
+    if(d.invoice_da>0) byMonth[mIdx].da.push(d.invoice_da);
+  });
 
-  // ── Eqs 13-17: SCR per month ───────────────────────────────────────────────
-  const monthly_sc: number[] = [];
-  const monthly_scr: number[] = [];
-  for (let m = 0; m < 12; m++) {
-    const sc = Math.round(Math.min(monthly_pv[m], monthly_cons_f[m])); // Eq.13
+  const monthly_cons:number[] = [];
+  let total_da=0, total_kwh=0;
+  for(let m=0;m<12;m++){
+    const kArr=byMonth[m].kwh, dArr=byMonth[m].da;
+    const avg_k = kArr.length>0 ? kArr.reduce((a,b)=>a+b,0)/kArr.length : 0;
+    const avg_d = dArr.length>0 ? dArr.reduce((a,b)=>a+b,0)/dArr.length : 0;
+    monthly_cons.push(Math.round(avg_k));
+    total_kwh += avg_k; total_da += avg_d;
+  }
+  // Fill missing months with average
+  const filledKwh=monthly_cons.filter(v=>v>0);
+  const avgK = filledKwh.length>0 ? filledKwh.reduce((a,b)=>a+b,0)/filledKwh.length : 40000;
+  const monthly_cons_f = monthly_cons.map(v=>v>0?v:Math.round(avgK));
+  const t0 = total_kwh>0 ? +(total_da/total_kwh).toFixed(4) : 4.8018;          // Eq.20
+  if(t0 < 4.0) warns.push(`T0=${t0} DA/kWh < 4.0 — missing peak hours (Cadran 3)?`);
+  if(t0 > 6.5) warns.push(`T0=${t0} DA/kWh > 6.5 — check for duplicate invoices.`);
+  const invoiceCount = invoices.filter(s=>s.status==="done").length;
+  if(invoiceCount < 12) warns.push(`Only ${invoiceCount} invoices uploaded. Minimum 12 recommended.`);
+
+  // Peak fraction (Eq.22)
+  let sum_peak=0, sum_total_inv=0;
+  invoices.filter(s=>s.status==="done"&&s.edited).forEach(s=>{
+    sum_peak += s.edited!.peak_kwh ?? 0;
+    sum_total_inv += s.edited!.total_kwh ?? 0;
+  });
+  const peak_fraction = sum_total_inv>0 ? +(sum_peak/sum_total_inv*100).toFixed(1) : 13.0;
+
+  // ── GROUP D: Self-Consumption (Eq 24-30) ──────────────────────────────────
+  const monthly_sc:number[] = [], monthly_scr:number[] = [];
+  for(let m=0;m<12;m++){
+    const sc = Math.min(monthly_pv[m], monthly_cons_f[m]);                     // Eq.24
+    const ex = Math.max(0, monthly_pv[m]-monthly_cons_f[m]);                   // Eq.25
+    const gr = Math.max(0, monthly_cons_f[m]-monthly_pv[m]);                   // Eq.26
+    const scr_m = monthly_pv[m]>0 ? +(sc/monthly_pv[m]*100).toFixed(1) : 0;   // Eq.27
     monthly_sc.push(sc);
-    monthly_scr.push(
-      monthly_pv[m] > 0 ? Math.round((sc / monthly_pv[m]) * 100) : 0,
-    );
-    monthly_detail[m].e_cons = Math.round(monthly_cons_f[m]);
-    monthly_detail[m].sc = sc;
-    monthly_detail[m].exported_m = Math.max(
-      0,
-      Math.round(monthly_pv[m] - monthly_cons_f[m]),
-    );
-    monthly_detail[m].scr_m = monthly_scr[m];
+    monthly_scr.push(scr_m);
+    monthly_detail[m].e_cons=monthly_cons_f[m]; monthly_detail[m].e_sc=sc;
+    monthly_detail[m].e_export=ex; monthly_detail[m].e_grid=gr; monthly_detail[m].scr_m=scr_m;
   }
-  const e_self_yr1 = monthly_sc.reduce((a, b) => a + b, 0); // Eq.15
-  const scr = parseFloat(((e_self_yr1 / e_annual) * 100).toFixed(2)); // Eq.14
-  const exported = Math.round(
-    monthly_pv.reduce((a, b) => a + b, 0) - e_self_yr1,
-  ); // Eq.16
-  const e_cons_annual = monthly_cons_f.reduce((a, b) => a + b, 0);
-  const ssr = parseFloat(((e_self_yr1 / e_cons_annual) * 100).toFixed(2)); // Eq.17
+  const e_self_yr1 = monthly_sc.reduce((a,b)=>a+b,0);                          // Eq.35
+  const scr_annual = +(e_self_yr1/e_annual*100).toFixed(2);                     // Eq.28
+  const e_cons_ann = monthly_cons_f.reduce((a,b)=>a+b,0);
+  const ssr = +(e_self_yr1/e_cons_ann*100).toFixed(2);                         // Eq.29
+  const e_surplus = monthly_pv.map((v,i)=>Math.max(0,v-monthly_cons_f[i])).reduce((a,b)=>a+b,0); // Eq.30
+  if(scr_annual<40) warns.push(`SCR=${scr_annual}% is very low. PV may be oversized.`);
 
-  // ── Eq.19: O&M ─────────────────────────────────────────────────────────────
-  const capex_total =
-    sys.c_modules +
-    sys.c_inverters +
-    sys.c_structure +
-    sys.c_cabling +
-    sys.c_transform +
-    sys.c_labor +
-    sys.c_eng;
-  const capex = Math.round(capex_total * 1.05); // Eq.18 (with 5% contingency)
-  const om_annual = Math.round(capex * (fin.om_rate / 100)); // Eq.19
+  // ── GROUP E: CAPEX (Eq 31-33) ─────────────────────────────────────────────
+  const c_modules   = n_modules * panel.price_dz;
+  const c_inverters = n_inverters * inv.price_dz;
+  const c_structure = p_installed * 4500;
+  const c_cables    = 1200000;
+  const c_connection= 800000;
+  const c_civil     = p_installed * 3500;
+  const c_engineering=650000;
+  const subtotal    = c_modules+c_inverters+c_structure+c_cables+c_connection+c_civil+c_engineering;
+  const c_contingency=Math.round(subtotal*0.05);
+  const capex       = Math.round(subtotal+c_contingency);                       // Eq.31
+  const cost_per_wp = +(capex/(p_installed*1000)).toFixed(2);                   // Eq.32
+  const inv_replacement = n_inverters * inv.price_dz;                          // Eq.33 (Year 15)
+  const capex_breakdown = [
+    {label:`Modules PV (${n_modules} × ${panel.price_dz.toLocaleString()} DA)`,val:c_modules},
+    {label:`Onduleurs (${n_inverters} × ${inv.price_dz.toLocaleString()} DA)`,val:c_inverters},
+    {label:`Structures aluminium (${p_installed} kWp × 4 500)`,val:Math.round(c_structure)},
+    {label:"Câblage & protection (forfait)",val:c_cables},
+    {label:"Raccordement HTA (forfait)",val:c_connection},
+    {label:`Main d'œuvre (${p_installed} kWp × 3 500)`,val:Math.round(c_civil)},
+    {label:"Études & permis (forfait)",val:c_engineering},
+    {label:"Contingences 5%",val:c_contingency},
+  ];
 
-  // ── Eqs 20-23: Year-1 financials ──────────────────────────────────────────
-  const yr1_energy_savings = Math.round(e_self_yr1 * t0); // Eq.20
-  const yr1_gross_savings = Math.round(yr1_energy_savings + fin.DS); // Eq.21
-  const yr1_net_cf = Math.round(yr1_gross_savings - om_annual); // Eq.22
-  const capex_sc2 = Math.round(capex * (1 - fin.subsidy_rate / 100)); // Eq.32
-  const spp_sc1 = parseFloat((capex / yr1_gross_savings).toFixed(1)); // Eq.23
-  const spp_sc2 = parseFloat((capex_sc2 / yr1_gross_savings).toFixed(1));
+  // ── GROUP F: DCF 25 Years (Eq 34-48) ─────────────────────────────────────
+  const om_annual = Math.round(capex * fin.om_rate/100);                        // Eq.34
+  const yr1_energy_sav = Math.round(e_self_yr1 * t0);                          // Eq.37
+  const yr1_gross_sav  = Math.round(yr1_energy_sav + fin.DS);                  // Eq.38
+  const yr1_net_cf     = Math.round(yr1_gross_sav - om_annual);                // Eq.40
+  const capex_sc2 = Math.round(capex * (1-fin.subsidy_rate/100));              // Eq.43
+  const spp_sc1 = +(capex/yr1_gross_sav).toFixed(1);                          // Eq.46
+  const spp_sc2 = +(capex_sc2/yr1_gross_sav).toFixed(1);
 
-  // ── Eqs 24-29: 25-yr DCF ──────────────────────────────────────────────────
-  const D_dec = fin.D / 100,
-    r_dec = fin.r / 100,
-    f_dec = fin.f / 100;
-  let cum_sc1 = -capex;
-  const dcf_table: DCFRow[] = [];
-  const cashflows: number[] = [];
-  let dpp_sc1: number | null = null;
-  for (let n = 1; n <= 25; n++) {
-    const e_self_n = e_self_yr1 * Math.pow(1 - D_dec, n - 1); // Eq.24
-    const t_n = t0 * Math.pow(1 + f_dec, n - 1); // Eq.25
-    const energy_savings = e_self_n * t_n;
-    const gross_savings = energy_savings + fin.DS; // Eq.26 (DS NEVER inflated)
-    const net_cf = gross_savings - om_annual;
-    const dcf = net_cf / Math.pow(1 + r_dec, n);
-    cashflows.push(net_cf);
-    cum_sc1 += dcf;
-    if (cum_sc1 >= 0 && dpp_sc1 === null) dpp_sc1 = n; // Eq.29
-    dcf_table.push({
-      year: n,
-      e_self_n: Math.round(e_self_n),
-      t_n: parseFloat(t_n.toFixed(4)),
-      energy_savings: Math.round(energy_savings),
-      ds: fin.DS,
-      gross_savings: Math.round(gross_savings),
-      om: Math.round(om_annual),
-      net_cf: Math.round(net_cf),
-      dcf: Math.round(dcf),
-      cum_sc1: Math.round(cum_sc1),
-      cum_sc2: 0,
-    });
+  const D=fin.D/100, r=fin.r/100, f=fin.f/100;
+  const loan_amount = capex*(1-fin.loan_down/100);
+  const annual_install = loan_amount*fin.loan_rate/100/(1-Math.pow(1+fin.loan_rate/100,-fin.loan_years));
+
+  let cum1=-capex, cum2=-capex_sc2, cum3=-(capex*fin.loan_down/100);
+  const dcf_table:DCFRow[] = [];
+  const cfs1:number[]=[], cfs2:number[]=[], cfs3:number[]=[];
+  let dpp1:number|null=null, dpp2:number|null=null, dpp3:number|null=null;
+
+  for(let n=1;n<=25;n++){
+    const e_n  = e_self_yr1*Math.pow(1-D,n-1);                                 // Eq.36
+    const t_n  = t0*Math.pow(1+f,n-1);                                         // Eq.21
+    const esav = e_n*t_n;                                                       // Eq.37
+    const gsav = esav+fin.DS;                                                   // Eq.38
+    const ir   = n===15 ? inv_replacement : 0;                                 // Eq.33
+    const ncf  = gsav - om_annual - ir;                                         // Eq.40
+    const dcf  = ncf/Math.pow(1+r,n);                                           // Eq.41
+    cfs1.push(ncf);
+    cum1 += dcf; if(cum1>=0&&dpp1===null) dpp1=n;                              // Eq.47
+    cum2 += dcf; if(cum2>=0&&dpp2===null) dpp2=n;
+    const loan_pay = n<=fin.loan_years ? annual_install : 0;
+    const ncf3 = ncf - loan_pay;                                                // Eq.45
+    cfs3.push(ncf3);
+    cum3 += ncf3/Math.pow(1+r,n); if(cum3>=0&&dpp3===null) dpp3=n;
+    cfs2.push(ncf);
+    dcf_table.push({year:n,e_self_n:Math.round(e_n),t_n:+t_n.toFixed(4),
+      energy_sav:Math.round(esav),ds:fin.DS,gross_sav:Math.round(gsav),
+      om:om_annual,inv_repl:ir,net_cf:Math.round(ncf),dcf:Math.round(dcf),
+      cum_sc1:Math.round(cum1),cum_sc2:Math.round(cum2+capex-capex_sc2),
+      cum_sc3:Math.round(cum3),net_cf_sc3:Math.round(ncf3)});
   }
-  const subsidy_offset = capex * (fin.subsidy_rate / 100);
-  let dpp_sc2: number | null = null;
-  dcf_table.forEach((row) => {
-    row.cum_sc2 = Math.round(row.cum_sc1 + subsidy_offset);
-    if (row.cum_sc2 >= 0 && dpp_sc2 === null) dpp_sc2 = row.year;
-  });
-  const npv_sc1 = Math.round(cum_sc1); // Eq.27
-  const npv_sc2 = Math.round(npv_sc1 + subsidy_offset);
-  const irr_sc1 = parseFloat((calcIRR(cashflows, capex) * 100).toFixed(2)); // Eq.28
-  const irr_sc2 = parseFloat((calcIRR(cashflows, capex_sc2) * 100).toFixed(2));
-  const pi_sc1 = parseFloat((1 + npv_sc1 / capex).toFixed(3)); // Eq.31
-  const pi_sc2 = parseFloat((1 + npv_sc2 / capex_sc2).toFixed(3));
+  const npv_sc1 = Math.round(cum1);                                             // Eq.42
+  const npv_sc2 = Math.round(npv_sc1+(capex-capex_sc2));                       // Eq.44
+  const npv_sc3 = Math.round(cum3);                                             // Eq.45
+  const irr_sc1 = +(solveIRR(cfs1,capex)*100).toFixed(2);                     // Eq.48
+  const irr_sc2 = +(solveIRR(cfs2,capex_sc2)*100).toFixed(2);
+  const irr_sc3 = +(solveIRR(cfs3,capex*fin.loan_down/100)*100).toFixed(2);
+  if(irr_sc1<fin.r) warns.push(`IRR Sc1 (${irr_sc1}%) < discount rate (${fin.r}%). Project may not meet investment criteria.`);
+  if(npv_sc1<0) warns.push("NPV Sc1 < 0. Not viable without subsidy — consider Scenario 2.");
 
-  // ── Eq.30: LCOE ───────────────────────────────────────────────────────────
-  let pv_om = 0,
-    pv_energy = 0;
-  for (let n = 1; n <= 25; n++) {
-    pv_om += om_annual / Math.pow(1 + r_dec, n);
-    pv_energy +=
-      (e_annual * Math.pow(1 - D_dec, n - 1)) / Math.pow(1 + r_dec, n);
+  // ── GROUP G: LCOE & PI (Eq 49-51) ─────────────────────────────────────────
+  let pv_om=0, pv_en=0;
+  for(let n=1;n<=25;n++){
+    pv_om += om_annual/Math.pow(1+r,n);
+    pv_en += (e_annual*Math.pow(1-D,n-1))/Math.pow(1+r,n);
   }
-  const lcoe = parseFloat(((capex + pv_om) / pv_energy).toFixed(2));
+  const lcoe = +((capex+pv_om+inv_replacement/Math.pow(1+r,15))/pv_en).toFixed(2); // Eq.49
+  const pi_sc1 = +(1+npv_sc1/capex).toFixed(3);                                // Eq.50
+  const pi_sc2 = +(1+npv_sc2/capex_sc2).toFixed(3);
+  const pi_sc3 = capex*fin.loan_down/100>0 ? +(1+npv_sc3/(capex*fin.loan_down/100)).toFixed(3) : 0;
 
-  // ── Eqs 33-35: Environmental + Net Metering ───────────────────────────────
-  const co2_yr1 = parseFloat(((e_annual * CO2_FACTOR) / 1000).toFixed(1)); // Eq.33
-  let co2_25yr = 0;
-  for (let n = 0; n < 25; n++)
-    co2_25yr += (e_annual * Math.pow(1 - D_dec, n) * CO2_FACTOR) / 1000; // Eq.34
-  const nm_revenue = Math.round(exported * NM_TARIFF); // Eq.35
-  const trees_equiv = Math.round(co2_yr1 * TREES_TCO2);
-  const vehicles_equiv = Math.round(co2_yr1 / VEHI_TCO2);
+  // ── GROUP H: Net Metering (Eq 52-53) ──────────────────────────────────────
+  const nm_revenue = Math.round(e_surplus*NM_TARIFF);                          // Eq.52
+  const npv_nm     = Math.round(nm_revenue*12.783);                            // Eq.53
+
+  // ── GROUP I: Environmental (Eq 54-55) ─────────────────────────────────────
+  const co2_yr1 = +(e_annual*CO2_FACTOR/1000).toFixed(1);                     // Eq.54
+  let co2_25yr=0;
+  for(let n=0;n<25;n++) co2_25yr+=e_annual*Math.pow(1-D,n)*CO2_FACTOR/1000;  // Eq.55
+  const trees_yr = Math.round(co2_yr1*50);
+  const vehi_yr  = Math.round(co2_yr1/2.3);
+  const gas_yr   = Math.round(e_annual*0.22);
+
+  // ── Break-even analysis (Eq.51) ───────────────────────────────────────────
+  let be_scr=0;
+  for(let s=50;s<=100;s++){
+    const es=e_annual*(s/100);
+    let cv=-capex;
+    for(let n=1;n<=25;n++){
+      const en=es*Math.pow(1-D,n-1), tn=t0*Math.pow(1+f,n-1);
+      const ir=n===15?inv_replacement:0;
+      cv+=(en*tn+fin.DS-om_annual-ir)/Math.pow(1+r,n);
+    }
+    if(cv>=0){be_scr=s;break;}
+  }
+  let be_tariff=0;
+  for(let t=10;t<=200;t+=5){
+    const T=t/10;
+    let cv=-capex;
+    for(let n=1;n<=25;n++){
+      const en=e_self_yr1*Math.pow(1-D,n-1), tn=T*Math.pow(1+f,n-1);
+      const ir=n===15?inv_replacement:0;
+      cv+=(en*tn+fin.DS-om_annual-ir)/Math.pow(1+r,n);
+    }
+    if(cv>=0){be_tariff=T;break;}
+  }
+
+  // ── Sensitivity Analysis ──────────────────────────────────────────────────
+  function npvForScr(scr_pct:number):number {
+    const es=e_annual*(scr_pct/100);
+    let cv=-capex;
+    for(let n=1;n<=25;n++){
+      const en=es*Math.pow(1-D,n-1),tn=t0*Math.pow(1+f,n-1),ir=n===15?inv_replacement:0;
+      cv+=(en*tn+fin.DS-om_annual-ir)/Math.pow(1+r,n);
+    }
+    return Math.round(cv);
+  }
+  function npvForGhi(mult:number):number {
+    const scaledPv=monthly_pv.map(v=>Math.round(v*mult));
+    const eSelf=scaledPv.map((v,i)=>Math.min(v,monthly_cons_f[i])).reduce((a,b)=>a+b,0);
+    const eAnn=scaledPv.reduce((a,b)=>a+b,0);
+    let cv=-capex;
+    for(let n=1;n<=25;n++){
+      const en=eSelf*Math.pow(1-D,n-1),tn=t0*Math.pow(1+f,n-1),ir=n===15?inv_replacement:0;
+      cv+=(en*tn+fin.DS-om_annual-ir)/Math.pow(1+r,n);
+    }
+    return Math.round(cv);
+  }
+  function npvForOm(rate_pct:number):number {
+    const om_v=Math.round(capex*rate_pct/100);
+    let cv=-capex;
+    for(let n=1;n<=25;n++){
+      const en=e_self_yr1*Math.pow(1-D,n-1),tn=t0*Math.pow(1+f,n-1),ir=n===15?inv_replacement:0;
+      cv+=(en*tn+fin.DS-om_v-ir)/Math.pow(1+r,n);
+    }
+    return Math.round(cv);
+  }
+
+  const sens_scr:SensRow[] = [50,60,70,75,80,scr_annual,90].map(s=>({
+    label:`${s}%`,npv:npvForScr(s),spp:+(capex/(e_annual*(s/100)*t0+fin.DS)).toFixed(1)
+  }));
+  const sens_ghi:SensRow[] = [0.80,0.90,1.00,1.10,1.20].map(m=>({
+    label:`${Math.round(wilaya.ghi_annual*m*100)/100} kWh/m²/j (×${m})`,
+    npv:npvForGhi(m),spp:0
+  }));
+  const sens_om:SensRow[] = [0.5,0.8,1.0,1.2,1.5,2.0].map(r=>({
+    label:`${r}%`,npv:npvForOm(r),spp:0
+  }));
 
   return {
-    a_available: a_avail,
-    e_annual: Math.round(e_annual),
-    fleh: Math.round(fleh),
-    monthly: monthly_detail,
-    monthly_pv,
-    monthly_cons: monthly_cons_f.map(Math.round),
-    monthly_sc,
-    monthly_scr,
-    scr,
-    e_self_yr1: Math.round(e_self_yr1),
-    exported,
-    ssr,
-    t0: parseFloat(t0.toFixed(4)),
-    total_da: Math.round(total_da),
-    total_kwh: Math.round(total_kwh),
-    capex,
-    capex_sc2,
-    om_annual,
-    yr1_energy_savings,
-    yr1_gross_savings,
-    yr1_net_cf,
-    spp_sc1,
-    spp_sc2,
-    npv_sc1,
-    npv_sc2,
-    irr_sc1,
-    irr_sc2,
-    dpp_sc1,
-    dpp_sc2,
-    pi_sc1,
-    pi_sc2,
-    lcoe,
-    dcf_table,
-    co2_yr1,
-    co2_25yr: Math.round(co2_25yr),
-    nm_revenue,
-    trees_equiv,
-    vehicles_equiv,
+    sizing,monthly:monthly_detail,e_annual,fleh,
+    monthly_pv,monthly_cons:monthly_cons_f,monthly_sc,monthly_scr,
+    scr_annual,e_self_yr1,e_surplus,ssr,t0,peak_fraction,
+    total_da:Math.round(total_da),total_kwh:Math.round(total_kwh),
+    capex,capex_sc2,capex_breakdown,cost_per_wp,inv_replacement,
+    om_annual,yr1_energy_sav,yr1_gross_sav,yr1_net_cf,spp_sc1,spp_sc2,
+    npv_sc1,npv_sc2,npv_sc3,irr_sc1,irr_sc2,irr_sc3,
+    dpp_sc1:dpp1,dpp_sc2:dpp2,dpp_sc3:dpp3,
+    pi_sc1,pi_sc2,pi_sc3,lcoe,nm_revenue,npv_nm,
+    co2_yr1,co2_25yr:Math.round(co2_25yr),trees_yr,vehi_yr,gas_yr,
+    dcf_table,sens_scr,sens_ghi,sens_om,be_scr,be_tariff:+be_tariff.toFixed(2),
+    warnings:warns,
   };
 }
 
-// ─── Canvas chart helpers ─────────────────────────────────────────────────────
-function makeBarChart(
-  v1: number[],
-  v2: number[] | null,
-  labels: string[],
-  w: number,
-  h: number,
-  c1 = C.gold,
-  c2 = C.navy,
-  title = "",
-): string {
-  const cvs = document.createElement("canvas");
-  cvs.width = w;
-  cvs.height = h;
-  const ctx = cvs.getContext("2d")!;
-  ctx.fillStyle = "#fff";
-  ctx.fillRect(0, 0, w, h);
-  const pad = { t: title ? 32 : 14, r: 16, b: 38, l: 60 };
-  const cw = w - pad.l - pad.r,
-    ch = h - pad.t - pad.b;
-  const all = [...v1, ...(v2 || [])];
-  const maxV = (Math.max(...all) || 1) * 1.15;
-  const gw = cw / v1.length,
-    bw = gw * (v2 ? 0.38 : 0.62);
-  if (title) {
-    ctx.fillStyle = "#374151";
-    ctx.font = "bold 11px Arial";
-    ctx.textAlign = "center";
-    ctx.fillText(title, w / 2, 18);
+// ─── Canvas helpers ───────────────────────────────────────────────────────────
+function makeBar(v1:number[],v2:number[]|null,labels:string[],w=540,h=160,c1=C.goldL,c2="#2c4a7a",title=""):string{
+  const cvs=document.createElement("canvas");cvs.width=w;cvs.height=h;
+  const ctx=cvs.getContext("2d")!;
+  ctx.fillStyle="#fff";ctx.fillRect(0,0,w,h);
+  const p={t:title?30:12,r:14,b:36,l:64};
+  const cw=w-p.l-p.r,ch=h-p.t-p.b;
+  const all=[...v1,...(v2||[])];
+  const mx=(Math.max(...all)||1)*1.15;
+  const gw=cw/v1.length,bw=gw*(v2?0.38:0.62);
+  if(title){ctx.fillStyle="#374151";ctx.font="bold 10px Arial";ctx.textAlign="center";ctx.fillText(title,w/2,16);}
+  for(let i=0;i<=4;i++){
+    const y=p.t+ch-(ch*i)/4;
+    ctx.strokeStyle="#e5e7eb";ctx.lineWidth=0.6;ctx.beginPath();ctx.moveTo(p.l,y);ctx.lineTo(p.l+cw,y);ctx.stroke();
+    ctx.fillStyle="#9ca3af";ctx.font="8px Arial";ctx.textAlign="right";
+    const v=Math.round((mx*i)/4);ctx.fillText(v>=1000?Math.round(v/1000)+"k":String(v),p.l-3,y+3);
   }
-  for (let i = 0; i <= 4; i++) {
-    const y = pad.t + ch - (ch * i) / 4;
-    ctx.strokeStyle = "#e5e7eb";
-    ctx.lineWidth = 0.7;
-    ctx.beginPath();
-    ctx.moveTo(pad.l, y);
-    ctx.lineTo(pad.l + cw, y);
-    ctx.stroke();
-    ctx.fillStyle = "#9ca3af";
-    ctx.font = "9px Arial";
-    ctx.textAlign = "right";
-    const v = Math.round((maxV * i) / 4);
-    ctx.fillText(
-      v >= 1000 ? Math.round(v / 1000) + "k" : String(v),
-      pad.l - 4,
-      y + 3,
-    );
-  }
-  v1.forEach((v, i) => {
-    const x = pad.l + i * gw,
-      bh = (v / maxV) * ch;
-    ctx.fillStyle = c1;
-    ctx.fillRect(x + (v2 ? gw * 0.06 : (gw - bw) / 2), pad.t + ch - bh, bw, bh);
-    if (v2) {
-      const bh2 = (v2[i] / maxV) * ch;
-      ctx.fillStyle = c2;
-      ctx.fillRect(x + gw * 0.52, pad.t + ch - bh2, bw, bh2);
-    }
-    ctx.fillStyle = "#374151";
-    ctx.font = "9px Arial";
-    ctx.textAlign = "center";
-    ctx.fillText(labels[i], x + gw / 2, h - pad.b + 14);
+  v1.forEach((v,i)=>{
+    const x=p.l+i*gw,bh=(v/mx)*ch;
+    ctx.fillStyle=c1;ctx.fillRect(x+(v2?gw*0.06:(gw-bw)/2),p.t+ch-bh,bw,bh);
+    if(v2){const bh2=(v2[i]/mx)*ch;ctx.fillStyle=c2;ctx.fillRect(x+gw*0.52,p.t+ch-bh2,bw,bh2);}
+    ctx.fillStyle="#374151";ctx.font="8px Arial";ctx.textAlign="center";ctx.fillText(labels[i],x+gw/2,h-p.b+13);
   });
-  ctx.strokeStyle = "#374151";
-  ctx.lineWidth = 1.2;
-  ctx.beginPath();
-  ctx.moveTo(pad.l, pad.t);
-  ctx.lineTo(pad.l, pad.t + ch);
-  ctx.lineTo(pad.l + cw, pad.t + ch);
-  ctx.stroke();
+  ctx.strokeStyle="#374151";ctx.lineWidth=1;ctx.beginPath();ctx.moveTo(p.l,p.t);ctx.lineTo(p.l,p.t+ch);ctx.lineTo(p.l+cw,p.t+ch);ctx.stroke();
   return cvs.toDataURL("image/png");
 }
 
-function makeLineChart(
-  d1: number[],
-  d2: number[],
-  labels: string[],
-  w: number,
-  h: number,
-): string {
-  const cvs = document.createElement("canvas");
-  cvs.width = w;
-  cvs.height = h;
-  const ctx = cvs.getContext("2d")!;
-  ctx.fillStyle = "#fff";
-  ctx.fillRect(0, 0, w, h);
-  const pad = { t: 34, r: 22, b: 42, l: 76 };
-  const cw = w - pad.l - pad.r,
-    ch = h - pad.t - pad.b;
-  const all = [...d1, ...d2];
-  const minV = Math.min(...all) * (Math.min(...all) < 0 ? 1.1 : 0.9);
-  const maxV = Math.max(...all) * 1.1;
-  const range = maxV - minV || 1;
-  const gx = (i: number) => pad.l + (i / (d1.length - 1)) * cw;
-  const gy = (v: number) => pad.t + ch - ((v - minV) / range) * ch;
-  if (minV < 0 && maxV > 0) {
-    const zy = gy(0);
-    ctx.strokeStyle = "#ef4444";
-    ctx.lineWidth = 0.8;
-    ctx.setLineDash([5, 4]);
-    ctx.beginPath();
-    ctx.moveTo(pad.l, zy);
-    ctx.lineTo(pad.l + cw, zy);
-    ctx.stroke();
-    ctx.setLineDash([]);
-    ctx.fillStyle = "#ef4444";
-    ctx.font = "8px Arial";
-    ctx.textAlign = "left";
-    ctx.fillText("Seuil de rentabilite", pad.l + 2, zy - 3);
-  }
-  for (let i = 0; i <= 4; i++) {
-    const v = minV + (range * i) / 4,
-      y = gy(v);
-    ctx.strokeStyle = "#e5e7eb";
-    ctx.lineWidth = 0.5;
-    ctx.beginPath();
-    ctx.moveTo(pad.l, y);
-    ctx.lineTo(pad.l + cw, y);
-    ctx.stroke();
-    ctx.fillStyle = "#9ca3af";
-    ctx.font = "9px Arial";
-    ctx.textAlign = "right";
-    ctx.fillText(
-      Math.abs(v) >= 1e6
-        ? (v / 1e6).toFixed(1) + "M"
-        : Math.round(v / 1000) + "k",
-      pad.l - 4,
-      y + 3,
-    );
-  }
-  const drawL = (data: number[], color: string, dash = false) => {
-    if (dash) ctx.setLineDash([6, 3]);
-    ctx.strokeStyle = color;
-    ctx.lineWidth = 2.5;
-    ctx.beginPath();
-    data.forEach((v, i) =>
-      i === 0 ? ctx.moveTo(gx(i), gy(v)) : ctx.lineTo(gx(i), gy(v)),
-    );
-    ctx.stroke();
-    ctx.setLineDash([]);
-  };
-  drawL(d1, C.gold);
-  drawL(d2, C.blue, true);
-  ctx.fillStyle = "#374151";
-  ctx.font = "9px Arial";
-  ctx.textAlign = "center";
-  labels.forEach((l, i) => {
-    if (i % 5 === 0 || i === labels.length - 1)
-      ctx.fillText(l, gx(i), h - pad.b + 14);
+function makeLine(d1:number[],d2:number[],d3:number[]|null,labels:string[],w=540,h=190):string{
+  const cvs=document.createElement("canvas");cvs.width=w;cvs.height=h;
+  const ctx=cvs.getContext("2d")!;
+  ctx.fillStyle="#fff";ctx.fillRect(0,0,w,h);
+  const p={t:34,r:20,b:42,l:80};
+  const cw=w-p.l-p.r,ch=h-p.t-p.b;
+  const all=[...d1,...d2,...(d3||[])];
+  const mn=Math.min(...all)*(Math.min(...all)<0?1.1:0.9);
+  const mx=Math.max(...all)*1.1;
+  const rng=mx-mn||1;
+  const gx=(i:number)=>p.l+(i/(d1.length-1))*cw;
+  const gy=(v:number)=>p.t+ch-((v-mn)/rng)*ch;
+  if(mn<0&&mx>0){const zy=gy(0);ctx.strokeStyle="#ef4444";ctx.lineWidth=0.8;ctx.setLineDash([4,3]);ctx.beginPath();ctx.moveTo(p.l,zy);ctx.lineTo(p.l+cw,zy);ctx.stroke();ctx.setLineDash([]);ctx.fillStyle="#ef4444";ctx.font="8px Arial";ctx.textAlign="left";ctx.fillText("Seuil",p.l+2,zy-2);}
+  for(let i=0;i<=4;i++){const v=mn+(rng*i)/4,y=gy(v);ctx.strokeStyle="#e5e7eb";ctx.lineWidth=0.4;ctx.beginPath();ctx.moveTo(p.l,y);ctx.lineTo(p.l+cw,y);ctx.stroke();ctx.fillStyle="#9ca3af";ctx.font="8px Arial";ctx.textAlign="right";ctx.fillText(Math.abs(v)>=1e6?(v/1e6).toFixed(1)+"M":Math.round(v/1000)+"k",p.l-3,y+3);}
+  const dl=(data:number[],color:string,dash=false)=>{if(dash)ctx.setLineDash([5,3]);ctx.strokeStyle=color;ctx.lineWidth=2.2;ctx.beginPath();data.forEach((v,i)=>i===0?ctx.moveTo(gx(i),gy(v)):ctx.lineTo(gx(i),gy(v)));ctx.stroke();ctx.setLineDash([]);};
+  dl(d1,C.goldL);dl(d2,"#60a5fa",true);if(d3)dl(d3,"#4ade80",true);
+  ctx.fillStyle="#374151";ctx.font="8px Arial";ctx.textAlign="center";labels.forEach((l,i)=>{if(i%5===0||i===labels.length-1)ctx.fillText(l,gx(i),h-p.b+13);});
+  ctx.strokeStyle="#374151";ctx.lineWidth=1;ctx.beginPath();ctx.moveTo(p.l,p.t);ctx.lineTo(p.l,p.t+ch);ctx.lineTo(p.l+cw,p.t+ch);ctx.stroke();
+  // legend
+  [[C.goldL,"Sc1"],[`#60a5fa`,"Sc2"],[d3?"#4ade80":"","Sc3"]].forEach(([c,l],i)=>{
+    if(!c) return;
+    ctx.fillStyle=c;ctx.fillRect(p.l+i*90,7,14,6);ctx.fillStyle="#374151";ctx.font="8px Arial";ctx.textAlign="left";ctx.fillText(l,p.l+i*90+17,13);
   });
-  ctx.strokeStyle = "#374151";
-  ctx.lineWidth = 1.2;
-  ctx.beginPath();
-  ctx.moveTo(pad.l, pad.t);
-  ctx.lineTo(pad.l, pad.t + ch);
-  ctx.lineTo(pad.l + cw, pad.t + ch);
-  ctx.stroke();
-  ctx.fillStyle = C.gold;
-  ctx.fillRect(pad.l, 8, 16, 7);
-  ctx.fillStyle = "#374151";
-  ctx.font = "9px Arial";
-  ctx.textAlign = "left";
-  ctx.fillText("Sc1 (sans subvention)", pad.l + 20, 15);
-  ctx.fillStyle = C.blue;
-  ctx.fillRect(pad.l + 145, 8, 16, 7);
-  ctx.fillText("Sc2 (avec subvention)", pad.l + 165, 15);
   return cvs.toDataURL("image/png");
 }
 
-// ─── PDF Report Generator (9 pages) ──────────────────────────────────────────
+// ══════════════════════════════════════════════════════════════════════════════
+//  PDF REPORT — 12 PAGES
+// ══════════════════════════════════════════════════════════════════════════════
 function generatePDF(
-  res: StudyResults,
-  loc: LocationParams,
-  sys: SystemParams,
-  fin: FinancialParams,
-) {
-  const wilaya = WILAYAS.find((w) => w.id === loc.wilaya_id) ?? WILAYAS[6];
-  const doc = new jsPDF({ orientation: "portrait", unit: "mm", format: "a4" });
-  const PW = doc.internal.pageSize.getWidth(),
-    PH = doc.internal.pageSize.getHeight();
-  const NAVY = [12, 19, 34] as [number, number, number];
-  const NAVY2 = [21, 32, 53] as [number, number, number];
-  const CREAM = [245, 237, 214] as [number, number, number];
-  const GOLD = [212, 168, 67] as [number, number, number];
-  const GRAY = [100, 110, 130] as [number, number, number];
-  const WHITE = [238, 240, 244] as [number, number, number];
-  const fmt = (n: number) => Math.round(n).toLocaleString("fr-DZ");
-  const fDA = (n: number) => fmt(n) + " DA";
-  let pn = 1;
-  const addPage = () => {
-    doc.addPage();
-    pn++;
-    doc.setFillColor(...GOLD);
-    doc.rect(0, 0, PW, 1.8, "F");
-    doc.setFillColor(...NAVY);
-    doc.rect(0, 1.8, PW, 7.5, "F");
-    doc.setFontSize(7);
-    doc.setTextColor(...CREAM);
-    doc.text(
-      `SolarAnalytics.dz  |  ${loc.building_name}  |  ${wilaya.name}  |  Page ${pn}`,
-      PW / 2,
-      6.8,
-      { align: "center" },
-    );
-    doc.setDrawColor(200, 200, 200);
-    doc.line(10, 9.5, PW - 10, 9.5);
+  res:StudyResults, loc:LocationParams, eq:EquipmentParams,
+  fin:FinancialParams
+){
+  const wilaya = WILAYAS.find(w=>w.id===loc.wilaya_id)??WILAYAS[6];
+  const panel  = PANEL_CATALOG.find(p=>p.id===eq.panel_id)??PANEL_CATALOG[0];
+  const inv    = INVERTER_CATALOG.find(i=>i.id===eq.inverter_id)??INVERTER_CATALOG[0];
+  const doc    = new jsPDF({orientation:"portrait",unit:"mm",format:"a4"});
+  const PW=doc.internal.pageSize.getWidth(), PH=doc.internal.pageSize.getHeight();
+  const NA=[12,20,38] as [number,number,number];  // navy
+  const GO=[201,150,42] as [number,number,number]; // gold
+  const CR=[244,237,213] as [number,number,number];// cream
+  const GR=[90,105,125] as [number,number,number]; // gray
+  const WH=[232,236,242] as [number,number,number];
+  const fmt=(n:number)=>Math.round(n).toLocaleString("fr-DZ");
+  const fDA=(n:number)=>fmt(n)+" DA";
+  let pn=1;
+  const hdr=()=>{
+    doc.addPage();pn++;
+    doc.setFillColor(...GO);doc.rect(0,0,PW,1.6,"F");
+    doc.setFillColor(...NA);doc.rect(0,1.6,PW,7.2,"F");
+    doc.setFontSize(6.5);doc.setTextColor(...CR);
+    doc.text(`SolarAnalytics.dz  |  ${loc.institution_name}  |  ${wilaya.name_fr}  |  p.${pn}`,PW/2,6.4,{align:"center"});
+    doc.setDrawColor(180,180,180);doc.line(10,9.0,PW-10,9.0);
   };
-  const hLine = (y: number, label: string) => {
-    doc.setFont("helvetica", "bold");
-    doc.setFontSize(12);
-    doc.setTextColor(...NAVY);
-    doc.text(label, 14, y);
-    doc.setFillColor(...GOLD);
-    doc.rect(14, y + 1.5, 40, 0.7, "F");
+  const sec=(y:number,txt:string)=>{
+    doc.setFont("helvetica","bold");doc.setFontSize(11);doc.setTextColor(...NA);
+    doc.text(txt,14,y);doc.setFillColor(...GO);doc.rect(14,y+1.5,38,0.6,"F");
   };
 
-  // ── Cover ─────────────────────────────────────────────────────────────────
-  doc.setFillColor(...NAVY);
-  doc.rect(0, 0, PW, PH, "F");
-  doc.setFillColor(...GOLD);
-  doc.rect(0, 0, 7, PH, "F");
-  doc.setFillColor(...NAVY2);
-  doc.rect(7, PH - 55, PW - 7, 55, "F");
-  doc.setFont("helvetica", "bold");
-  doc.setFontSize(22);
-  doc.setTextColor(...GOLD);
-  doc.text("SolarAnalytics.dz", 22, 36);
-  doc.setFontSize(12);
-  doc.setFont("helvetica", "normal");
-  doc.setTextColor(...WHITE);
-  doc.text("Etude de Faisabilite Technico-Economique", 22, 47);
-  doc.setFontSize(9);
-  doc.setTextColor(...GRAY);
-  doc.text(
-    "Systeme Photovoltaique Connecte au Reseau  —  IEC 61724-1:2021",
-    22,
-    55,
-  );
-  doc.setDrawColor(...GOLD);
-  doc.setLineWidth(0.5);
-  doc.line(22, 60, PW - 22, 60);
-  [
-    ["Projet", loc.building_name],
-    ["Adresse", loc.building_address],
-    [
-      "Wilaya / GHI",
-      `${wilaya.name}  —  ${wilaya.ghi_yr} kWh/m²/an  (${(wilaya.ghi_yr / 365).toFixed(2)} kWh/m²/j)`,
-    ],
-    [
-      "Systeme",
-      `${sys.p_installed} kWp — ${sys.n_modules} modules — ${sys.n_inverters} onduleurs`,
-    ],
-    [
-      "Surface",
-      `${loc.gross_area} m² brute → ${res.a_available} m² nette (SF=0.70)`,
-    ],
-    [
-      "Date",
-      new Date().toLocaleDateString("fr-FR", {
-        year: "numeric",
-        month: "long",
-        day: "numeric",
-      }),
-    ],
-  ].forEach(([k, v], i) => {
-    const y = 70 + i * 9;
-    doc.setFont("helvetica", "bold");
-    doc.setFontSize(8);
-    doc.setTextColor(...GOLD);
-    doc.text(k + ":", 22, y);
-    doc.setFont("helvetica", "normal");
-    doc.setTextColor(...WHITE);
-    doc.text(v, 58, y);
+  // ── P1: Cover ──────────────────────────────────────────────────────────────
+  doc.setFillColor(...NA);doc.rect(0,0,PW,PH,"F");
+  doc.setFillColor(...GO);doc.rect(0,0,8,PH,"F");
+  doc.setFillColor(19,32,58);doc.rect(8,PH-52,PW-8,52,"F");
+  doc.setFont("helvetica","bold");doc.setFontSize(20);doc.setTextColor(...GO);
+  doc.text("SolarAnalytics.dz",24,34);
+  doc.setFontSize(11);doc.setFont("helvetica","normal");doc.setTextColor(...WH);
+  doc.text("Étude de Faisabilité Technico-Économique",24,45);
+  doc.setFontSize(9);doc.setTextColor(...GR);
+  doc.text(`Système Photovoltaïque ${res.sizing.p_installed} kWp connecté au réseau — IEC 61724-1:2021`,24,53);
+  doc.setDrawColor(...GO);doc.setLineWidth(0.5);doc.line(24,58,PW-24,58);
+  [["Institution",loc.institution_name],["Type",loc.institution_type],["Wilaya / GHI",`${wilaya.name_fr} — ${wilaya.ghi_annual} kWh/m²/j`],
+   ["Modules",`${panel.brand} ${panel.model} (${panel.power_wp}Wp, ${panel.technology})`],
+   ["Onduleurs",`${inv.brand} ${inv.model} (${inv.power_kw} kW)`],
+   ["Système",`${res.sizing.n_modules} modules / ${res.sizing.p_installed} kWp / ${res.sizing.n_inverters} onduleurs`],
+   ["Date",new Date().toLocaleDateString("fr-FR",{year:"numeric",month:"long",day:"numeric"})],
+  ].forEach(([k,v],i)=>{
+    const y=68+i*9;
+    doc.setFont("helvetica","bold");doc.setFontSize(8);doc.setTextColor(...GO);doc.text(k+":",24,y);
+    doc.setFont("helvetica","normal");doc.setTextColor(...WH);doc.text(v,62,y);
   });
-  const kpis = [
-    {
-      l: "VAN Sc1",
-      v: `${(res.npv_sc1 / 1e6).toFixed(2)} M DA`,
-      ok: res.npv_sc1 > 0,
-    },
-    { l: "TRI Sc1", v: `${res.irr_sc1}%`, ok: true },
-    { l: "DRA Sc1", v: `${res.dpp_sc1 ?? ">25"} ans`, ok: true },
-    { l: "LCOE", v: `${res.lcoe} DA/kWh`, ok: true },
-  ];
-  kpis.forEach((k, i) => {
-    const x = 22 + i * 46;
-    doc.setFillColor(29, 45, 74);
-    doc.roundedRect(x, 125, 42, 22, 2, 2, "F");
-    doc.setFont("helvetica", "bold");
-    doc.setFontSize(10);
-    if (k.ok) {
-      doc.setTextColor(...GOLD);
-    } else {
-      doc.setTextColor(239, 68, 68);
-    }
-    doc.text(k.v, x + 21, 134, { align: "center" });
-    doc.setFont("helvetica", "normal");
-    doc.setFontSize(7);
-    doc.setTextColor(...GRAY);
-    doc.text(k.l, x + 21, 140, { align: "center" });
+  // KPI cards
+  [{l:"VAN Sc1",v:`${(res.npv_sc1/1e6).toFixed(2)} M DA`,ok:res.npv_sc1>0},
+   {l:"TRI Sc1",v:`${res.irr_sc1}%`,ok:res.irr_sc1>fin.r},
+   {l:"DRA Sc1",v:`${res.dpp_sc1??">25"} ans`,ok:!!res.dpp_sc1},
+   {l:"LCOE",v:`${res.lcoe} DA/kWh`,ok:true},
+  ].forEach((k,i)=>{
+    const x=24+i*46;
+    doc.setFillColor(20,34,60);doc.roundedRect(x,132,42,22,2,2,"F");
+    doc.setFont("helvetica","bold");doc.setFontSize(10);
+    if(k.ok){doc.setTextColor(...GO);}else{doc.setTextColor(239,68,68);}
+    doc.text(k.v,x+21,141,{align:"center"});
+    doc.setFont("helvetica","normal");doc.setFontSize(7);doc.setTextColor(...GR);
+    doc.text(k.l,x+21,149,{align:"center"});
   });
-  doc.setFontSize(7);
-  doc.setTextColor(...GRAY);
-  doc.text(
-    "SCR mensuel reel: min(E_PV,m,E_cons,m) | T0 pondere: Σ(DA)/Σ(kWh) | DS FIXE non indexe",
-    22,
-    152,
-  );
-  doc.text(
-    "Equations 1-35 implementees | Toutes les 58 wilayas | Reference: PRD Biskra 2025-2026",
-    22,
-    158,
-  );
-  doc.setFontSize(7);
-  doc.setTextColor(70, 80, 100);
-  doc.text("(c) SolarAnalytics.dz — Document Confidentiel", PW / 2, PH - 8, {
-    align: "center",
+  doc.setFontSize(6.5);doc.setTextColor(...GR);
+  doc.text("SCR calculé mensuellement | T₀ = Σ(DA)/Σ(kWh) | DS fixe non indexé | Remplacement onduleurs An 15",24,162);
+  doc.text(`Droits de douane 5% inclus dans le CAPEX | Inflation tarifaire ${fin.f}%/an | Taux actualisation ${fin.r}%`,24,167);
+  doc.text("(c) SolarAnalytics.dz — Confidentiel — Pré-Faisabilité uniquement",PW/2,PH-8,{align:"center"});
+
+  // ── P2: Executive Summary ─────────────────────────────────────────────────
+  hdr();sec(20,"Résumé Exécutif");
+  autoTable(doc,{startY:27,
+    head:[["Indicateur","Sc1 — Sans subvention","Sc2 — Subvention","Sc3 — Crédit bancaire","Unité"]],
+    body:[
+      ["CAPEX",fDA(res.capex),fDA(res.capex_sc2),fDA(res.capex),"DA"],
+      ["DRS (Eq.46)",`${res.spp_sc1} ans`,`${res.spp_sc2} ans`,"—","ans"],
+      ["VAN 25 ans (Eq.42-45)",fDA(res.npv_sc1),fDA(res.npv_sc2),fDA(res.npv_sc3),"DA"],
+      ["TRI (Eq.48)",`${res.irr_sc1}%`,`${res.irr_sc2}%`,`${res.irr_sc3}%`,""],
+      ["DRA (Eq.47)",`${res.dpp_sc1??">25"} ans`,`${res.dpp_sc2??">25"} ans`,`${res.dpp_sc3??">25"} ans`,"ans"],
+      ["IP (Eq.50)",res.pi_sc1.toString(),res.pi_sc2.toString(),res.pi_sc3.toString(),""],
+      ["LCOE (Eq.49)",`${res.lcoe} DA/kWh`,`${res.lcoe} DA/kWh`,"—","DA/kWh"],
+    ],
+    headStyles:{fillColor:NA,textColor:CR,fontStyle:"bold",fontSize:7.5},
+    bodyStyles:{fontSize:8},alternateRowStyles:{fillColor:[254,252,232]},
+    columnStyles:{1:{halign:"right"},2:{halign:"right"},3:{halign:"right"},4:{halign:"center"}},
+  });
+  const y2=(doc as any).lastAutoTable.finalY+6;
+  autoTable(doc,{startY:y2,
+    head:[["Indicateur Technique","Valeur","Unité"]],
+    body:[
+      [`Surface brute → nette (Eq.1)`,`${loc.gross_area} → ${res.sizing.a_available} m²`,"m²"],
+      [`Production annuelle (Eq.14)`,fmt(res.e_annual),"kWh/an"],
+      ["FLEH (Eq.16)",fmt(res.fleh),"h/an"],
+      ["SCR annuel calculé (Eq.28)",`${res.scr_annual}%`,""],
+      ["Taux autosuffisance SSR (Eq.29)",`${res.ssr}%`,""],
+      ["Surplus exporté (Eq.30)",fmt(res.e_surplus),"kWh/an"],
+      ["Tarif pondéré T₀ (Eq.20)",`${res.t0}`,"/kWh"],
+      ["Fraction heures de pointe (Eq.22)",`${res.peak_fraction}%`,""],
+      ["CO₂ évité An 1 (Eq.54)",`${res.co2_yr1} t`,  "tCO₂/an"],
+      ["Revenus comptage net (Eq.52)",fDA(res.nm_revenue),"DA/an"],
+    ],
+    headStyles:{fillColor:CR,textColor:NA,fontStyle:"bold",fontSize:7.5},
+    bodyStyles:{fontSize:8},alternateRowStyles:{fillColor:[254,252,232]},
+    columnStyles:{1:{halign:"right"},2:{halign:"center"}},
   });
 
-  // ── P2: Resume Executif ───────────────────────────────────────────────────
-  addPage();
-  hLine(20, "Resume Executif");
-  autoTable(doc, {
-    startY: 27,
-    head: [
-      ["Indicateur", "Sc1 — Sans subvention", "Sc2 — Avec subvention", "Unite"],
+  // ── P3: System Sizing ─────────────────────────────────────────────────────
+  hdr();sec(20,"Dimensionnement du Système (Eq. 1-8)");
+  autoTable(doc,{startY:27,
+    head:[["Équation","Calcul","Résultat","Validation"]],
+    body:[
+      ["Eq.1 — Surface nette",`${loc.gross_area} × 0.70`,`${res.sizing.a_available} m²`,"SF=0.70 setbacks+allées"],
+      ["Eq.2 — Modules max",`${res.sizing.a_available} / 2.77 m²`,`${res.sizing.n_modules_max} mod.`,"A_module_pitch=2.77 m² à 30°"],
+      ["Eq.3 — Strings",`floor(${res.sizing.n_modules_max} / 14)`,`${res.sizing.n_strings} strings`,"14 mod./string (MPPT SMA)"],
+      ["Eq.4 — Modules réels",`${res.sizing.n_strings} × 14`,`${res.sizing.n_modules} modules`,"Multiple exact de 14"],
+      ["Eq.5 — P installée",`${res.sizing.n_modules} × ${panel.power_wp}W / 1000`,`${res.sizing.p_installed} kWp`,"Puissance STC par module"],
+      ["Eq.6 — Onduleurs",`ceil(${res.sizing.p_installed} / ${inv.power_kw})`,`${res.sizing.n_inverters} × ${inv.model}`,"1 onduleur = ${inv.power_kw} kW AC"],
+      ["Eq.7 — Ratio DC/AC",`${res.sizing.p_installed} / (${res.sizing.n_inverters} × ${inv.power_kw})`,`${res.sizing.dc_ac_ratio}`,res.sizing.dc_ac_ratio>=1.05&&res.sizing.dc_ac_ratio<=1.30?"✓ [1.05–1.30]":"⚠ Hors plage"],
+      ["Eq.8 — Transformateur",`ceil(${res.sizing.n_inverters}×${inv.power_kw}/0.90)`,`${res.sizing.c_transformer_kva} kVA`,"cos φ=0.90 raccordement HTA"],
     ],
-    body: [
-      ["Valeur Actuelle Nette (VAN)", fmt(res.npv_sc1), fmt(res.npv_sc2), "DA"],
-      [
-        "Taux de Rentabilite Interne (TRI)",
-        `${res.irr_sc1}%`,
-        `${res.irr_sc2}%`,
-        "",
-      ],
-      [
-        "Delai Recup. Simple (DRS)",
-        `${res.spp_sc1} ans`,
-        `${res.spp_sc2} ans`,
-        "ans",
-      ],
-      [
-        "Delai Recup. Actualise (DRA)",
-        `${res.dpp_sc1 ?? ">25"} ans`,
-        `${res.dpp_sc2 ?? ">25"} ans`,
-        "ans",
-      ],
-      [
-        "Indice de Profitabilite (IP)",
-        res.pi_sc1.toFixed(3),
-        res.pi_sc2.toFixed(3),
-        "",
-      ],
-      ["LCOE", res.lcoe.toFixed(2), res.lcoe.toFixed(2), "DA/kWh"],
-      ["CAPEX", fDA(res.capex), fDA(res.capex_sc2), "DA"],
-      [
-        "Economies An 1 (brutes)",
-        fDA(res.yr1_gross_savings),
-        fDA(res.yr1_gross_savings),
-        "DA/an",
-      ],
-    ],
-    headStyles: {
-      fillColor: NAVY,
-      textColor: CREAM,
-      fontStyle: "bold",
-      fontSize: 8,
-    },
-    bodyStyles: { fontSize: 8 },
-    alternateRowStyles: { fillColor: [254, 252, 232] },
-    columnStyles: {
-      1: { halign: "right" },
-      2: { halign: "right" },
-      3: { halign: "center" },
-    },
+    headStyles:{fillColor:NA,textColor:CR,fontStyle:"bold",fontSize:7.5},
+    bodyStyles:{fontSize:8},alternateRowStyles:{fillColor:[254,252,232]},
   });
-  const y2 = (doc as any).lastAutoTable.finalY + 6;
-  autoTable(doc, {
-    startY: y2,
-    head: [["Indicateur Technique", "Valeur", "Unite"]],
-    body: [
-      [
-        "Surface brute / nette (SF=0.70)",
-        `${loc.gross_area} / ${res.a_available} m²`,
-        "m²",
-      ],
-      ["Production annuelle (Eq.4)", fmt(res.e_annual), "kWh/an"],
-      ["FLEH (Eq.5)", fmt(res.fleh), "h/an"],
-      ["SCR annuel calcule (Eq.14)", `${res.scr}%`, ""],
-      ["Taux Autosuffisance SSR (Eq.17)", `${res.ssr}%`, ""],
-      ["Energie autoconsommee An 1", fmt(res.e_self_yr1), "kWh/an"],
-      ["Surplus exporte (Eq.16)", fmt(res.exported), "kWh/an"],
-      ["Tarif pondere T0 (Eq.10)", res.t0.toFixed(4), "DA/kWh"],
-      ["CO2 evite An 1 (Eq.33)", `${res.co2_yr1} t`, "tCO2/an"],
-      ["Revenus comptage net (Eq.35)", fDA(res.nm_revenue), "DA/an"],
-    ],
-    headStyles: {
-      fillColor: CREAM,
-      textColor: NAVY,
-      fontStyle: "bold",
-      fontSize: 8,
-    },
-    bodyStyles: { fontSize: 8 },
-    alternateRowStyles: { fillColor: [254, 252, 232] },
-    columnStyles: { 1: { halign: "right" }, 2: { halign: "center" } },
+  const y3=(doc as any).lastAutoTable.finalY+8;
+  doc.setFontSize(8);doc.setTextColor(...GR);
+  doc.text(`Modules ${panel.brand} ${panel.model}: ${panel.power_wp}Wp ${panel.technology} | η=${panel.efficiency}% | NOCT=${panel.noct}°C | γ=${panel.gamma}%/°C | ${panel.warranty_yrs}yr garantie`,14,y3);
+  doc.text(`Onduleurs ${inv.brand} ${inv.model}: ${inv.power_kw}kW AC | η=${inv.efficiency}% | ${inv.warranty_yrs}yr garantie | Remplacement prévu An 15`,14,y3+7);
+  doc.text(`Surface occupée: ${res.sizing.area_occupied.toFixed(0)} m² sur ${res.sizing.a_available} m² disponibles (${(res.sizing.area_occupied/res.sizing.a_available*100).toFixed(0)}%)`,14,y3+14);
+
+  // ── P4: Monthly Production (Eq 9-17) ─────────────────────────────────────
+  hdr();sec(20,"Production Mensuelle — PR Corrigé en Température (Eq. 9-17)");
+  autoTable(doc,{startY:27,
+    head:[["Mois","GHI/j","T_amb","T_cell (Eq.9)","PR_temp (Eq.10)","PR_soiling","PR_total (Eq.12)","E_PV (Eq.13)"]],
+    body:res.monthly.map((r,i)=>[M_F[i],`${r.ghi_d} kWh/m²`,`${r.t_amb}°C`,`${r.t_cell}°C`,`${r.pr_temp}%`,`${(r.pr_soiling*100).toFixed(1)}%`,`${r.pr_total}%`,fmt(r.e_pv)+" kWh"]),
+    foot:[["ANNUEL",`${wilaya.ghi_annual} moy.`,"—","—",`${(res.monthly.reduce((s,r)=>s+r.pr_temp,0)/12).toFixed(1)}%`,"—",`${(res.monthly.reduce((s,r)=>s+r.pr_total,0)/12).toFixed(1)}%`,fmt(res.e_annual)+" kWh"]],
+    headStyles:{fillColor:NA,textColor:CR,fontStyle:"bold",fontSize:6.5},
+    bodyStyles:{fontSize:7.5},alternateRowStyles:{fillColor:[254,252,232]},
+    footStyles:{fillColor:GO,textColor:NA,fontStyle:"bold",fontSize:7.5},
+    columnStyles:{1:{halign:"right"},2:{halign:"right"},3:{halign:"right"},4:{halign:"right"},5:{halign:"right"},6:{halign:"right"},7:{halign:"right"}},
   });
 
-  // ── P3: Dimensionnement (Eqs 1-3) ────────────────────────────────────────
-  addPage();
-  hLine(20, "Dimensionnement du Systeme (Equations 1-3)");
-  autoTable(doc, {
-    startY: 27,
-    head: [["Etape", "Equation", "Valeur", "Remarque"]],
-    body: [
-      [
-        "Eq.1 — Surface nette",
-        "A_avail = A_brute × SF",
-        `${loc.gross_area} × 0.70 = ${res.a_available} m²`,
-        "SF = 0.70 (setbacks + espacement)",
-      ],
-      [
-        "Eq.2 — Nb. modules",
-        "N = floor(A_avail / 1.940)",
-        `${res.a_available} / 1.940 = ${sys.n_modules}`,
-        "Jinko JKM 370M-72, empreinte = 1.940 m²",
-      ],
-      [
-        "Eq.3 — Puissance",
-        "P = N × 370.3 / 1000",
-        `${sys.n_modules} × 370.3 / 1000 = ${sys.p_installed} kWp`,
-        "Puissance STC par module",
-      ],
-      [
-        "Eq.4 — Production",
-        "E = P × GHI_j × PR × 365",
-        `${sys.p_installed} × ${(wilaya.ghi_yr / 365).toFixed(2)} × ${sys.pr / 100} × 365 = ${fmt(res.e_annual)} kWh`,
-        "GHI Wilaya ${wilaya.name}",
-      ],
-      [
-        "Eq.5 — FLEH",
-        "FLEH = E / P",
-        `${fmt(res.e_annual)} / ${sys.p_installed} = ${res.fleh} h/an`,
-        "Heures pleine charge",
-      ],
-    ],
-    headStyles: {
-      fillColor: NAVY,
-      textColor: CREAM,
-      fontStyle: "bold",
-      fontSize: 8,
-    },
-    bodyStyles: { fontSize: 8 },
-    alternateRowStyles: { fillColor: [254, 252, 232] },
+  // ── P5: Consumption & SCR ─────────────────────────────────────────────────
+  hdr();sec(20,"Consommation & Autoconsommation (Eq. 18-30)");
+  doc.setFontSize(7.5);doc.setTextColor(...GR);
+  doc.text(`T₀ (Eq.20)=${res.t0} DA/kWh | Total=${fmt(res.total_kwh)} kWh — ${fmt(res.total_da)} DA | SCR (Eq.28)=${res.scr_annual}% | SSR (Eq.29)=${res.ssr}% | Part pointe (Eq.22)=${res.peak_fraction}%`,14,28);
+  autoTable(doc,{startY:33,
+    head:[["Mois","E_PV (kWh)","E_Cons (kWh)","E_SC (Eq.24)","E_Export (Eq.25)","E_Réseau (Eq.26)","SCR% (Eq.27)"]],
+    body:res.monthly.map((r,i)=>[M_F[i],fmt(r.e_pv),fmt(r.e_cons),fmt(r.e_sc),r.e_export>0?fmt(r.e_export):"—",r.e_grid>0?fmt(r.e_grid):"—",`${r.scr_m}%`]),
+    foot:[["ANNUEL",fmt(res.e_annual),fmt(res.monthly_cons.reduce((a,b)=>a+b,0)),fmt(res.e_self_yr1),fmt(res.e_surplus),"—",`${res.scr_annual}%`]],
+    headStyles:{fillColor:NA,textColor:CR,fontStyle:"bold",fontSize:7},
+    bodyStyles:{fontSize:8},alternateRowStyles:{fillColor:[254,252,232]},
+    footStyles:{fillColor:GO,textColor:NA,fontStyle:"bold",fontSize:8},
+    columnStyles:{1:{halign:"right"},2:{halign:"right"},3:{halign:"right"},4:{halign:"right"},5:{halign:"right"},6:{halign:"right"}},
   });
-  const y3 = (doc as any).lastAutoTable.finalY + 6;
-  hLine(y3, "CAPEX Detaille (Equation 18)");
-  const subtotal =
-    sys.c_modules +
-    sys.c_inverters +
-    sys.c_structure +
-    sys.c_cabling +
-    sys.c_transform +
-    sys.c_labor +
-    sys.c_eng;
-  autoTable(doc, {
-    startY: y3 + 8,
-    head: [["Composant", "Calcul", "Montant (DA)", "% CAPEX"]],
-    body: [
-      [
-        "Modules PV",
-        `${sys.n_modules} × 9 500`,
-        fDA(sys.c_modules),
-        ((sys.c_modules / res.capex) * 100).toFixed(1) + "%",
-      ],
-      [
-        "Onduleurs",
-        `${sys.n_inverters} × 2 200 000`,
-        fDA(sys.c_inverters),
-        ((sys.c_inverters / res.capex) * 100).toFixed(1) + "%",
-      ],
-      [
-        "Structures aluminium",
-        `${sys.p_installed} kWp × 4 500`,
-        fDA(sys.c_structure),
-        ((sys.c_structure / res.capex) * 100).toFixed(1) + "%",
-      ],
-      [
-        "Cablage & protection",
-        "Forfait",
-        fDA(sys.c_cabling),
-        ((sys.c_cabling / res.capex) * 100).toFixed(1) + "%",
-      ],
-      [
-        "Raccordement HTA",
-        "Forfait",
-        fDA(sys.c_transform),
-        ((sys.c_transform / res.capex) * 100).toFixed(1) + "%",
-      ],
-      [
-        "Main d'oeuvre",
-        `${sys.p_installed} kWp × 3 500`,
-        fDA(sys.c_labor),
-        ((sys.c_labor / res.capex) * 100).toFixed(1) + "%",
-      ],
-      [
-        "Etudes & permis",
-        "Forfait",
-        fDA(sys.c_eng),
-        ((sys.c_eng / res.capex) * 100).toFixed(1) + "%",
-      ],
-      [
-        "Contingences (5%)",
-        "5% × sous-total",
-        fDA(Math.round(subtotal * 0.05)),
-        "5.0%",
-      ],
-    ],
-    foot: [["CAPEX TOTAL", "", "" + fDA(res.capex), "100%"]],
-    headStyles: {
-      fillColor: NAVY,
-      textColor: CREAM,
-      fontStyle: "bold",
-      fontSize: 8,
-    },
-    bodyStyles: { fontSize: 8 },
-    alternateRowStyles: { fillColor: [254, 252, 232] },
-    footStyles: {
-      fillColor: GOLD,
-      textColor: NAVY,
-      fontStyle: "bold",
-      fontSize: 8,
-    },
-    columnStyles: { 2: { halign: "right" }, 3: { halign: "right" } },
-  });
-
-  // ── P4: Production mensuelle (Eqs 6-9) ───────────────────────────────────
-  addPage();
-  hLine(20, "Production Mensuelle — Temperature Corrigee (Equations 6-9)");
-  autoTable(doc, {
-    startY: 27,
-    head: [
-      [
-        "Mois",
-        "GHI/j",
-        "T_amb",
-        "T_cell (Eq.6)",
-        "PR_temp (Eq.7)",
-        "PR_soiling",
-        "PR_total (Eq.8)",
-        "E_PV (Eq.9) kWh",
-      ],
-    ],
-    body: res.monthly.map((r, i) => [
-      M_FULL[i],
-      r.ghi_daily.toFixed(2) + "  kWh/m²",
-      r.t_amb + "°C",
-      r.t_cell + "°C",
-      r.pr_temp + "%",
-      (r.pr_soiling * 100).toFixed(1) + "%",
-      r.pr_total + "%",
-      fmt(r.e_pv),
-    ]),
-    foot: [
-      [
-        "ANNUEL",
-        `${(wilaya.ghi_yr / 365).toFixed(2)} moy`,
-        "—",
-        "—",
-        `${(res.monthly.reduce((s, r) => s + r.pr_temp, 0) / 12).toFixed(1)}%`,
-        "—",
-        `${(res.monthly.reduce((s, r) => s + r.pr_total, 0) / 12).toFixed(1)}%`,
-        fmt(res.e_annual),
-      ],
-    ],
-    headStyles: {
-      fillColor: NAVY,
-      textColor: CREAM,
-      fontStyle: "bold",
-      fontSize: 6.5,
-    },
-    bodyStyles: { fontSize: 7.5 },
-    alternateRowStyles: { fillColor: [254, 252, 232] },
-    footStyles: {
-      fillColor: GOLD,
-      textColor: NAVY,
-      fontStyle: "bold",
-      fontSize: 7.5,
-    },
-    columnStyles: {
-      1: { halign: "right" },
-      2: { halign: "right" },
-      3: { halign: "right" },
-      4: { halign: "right" },
-      5: { halign: "right" },
-      6: { halign: "right" },
-      7: { halign: "right" },
-    },
-  });
-
-  // ── P5: SCR mensuel (Eqs 13-17) + Factures (Eqs 10-12) ───────────────────
-  addPage();
-  hLine(20, "Bilan Energetique & SCR (Equations 10-17)");
-  doc.setFontSize(8);
-  doc.setTextColor(...GRAY);
-  doc.text(
-    `T0 pondere (Eq.10): ${res.t0} DA/kWh  |  Total: ${fmt(res.total_da)} DA / ${fmt(res.total_kwh)} kWh  |  SCR annuel (Eq.14): ${res.scr}%  |  SSR (Eq.17): ${res.ssr}%`,
-    14,
-    29,
-  );
-  autoTable(doc, {
-    startY: 33,
-    head: [
-      [
-        "Mois",
-        "E_PV (kWh)",
-        "E_Cons (kWh)",
-        "SC (kWh) Eq.13",
-        "Surplus (kWh) Eq.16",
-        "SCR% Eq.13",
-        "SSR%",
-      ],
-    ],
-    body: res.monthly.map((r, i) => [
-      M_FULL[i],
-      fmt(r.e_pv),
-      fmt(r.e_cons),
-      fmt(r.sc),
-      r.exported_m > 0 ? fmt(r.exported_m) : "—",
-      r.scr_m + "%",
-      r.e_cons > 0
-        ? Math.min(100, Math.round((r.sc / r.e_cons) * 100)) + "%"
-        : "—",
-    ]),
-    foot: [
-      [
-        "ANNUEL",
-        fmt(res.e_annual),
-        fmt(res.monthly_cons.reduce((a, b) => a + b, 0)),
-        fmt(res.e_self_yr1),
-        fmt(res.exported),
-        `${res.scr}%`,
-        `${res.ssr}%`,
-      ],
-    ],
-    headStyles: {
-      fillColor: NAVY,
-      textColor: CREAM,
-      fontStyle: "bold",
-      fontSize: 7,
-    },
-    bodyStyles: { fontSize: 8 },
-    alternateRowStyles: { fillColor: [254, 252, 232] },
-    footStyles: {
-      fillColor: GOLD,
-      textColor: NAVY,
-      fontStyle: "bold",
-      fontSize: 8,
-    },
-    columnStyles: {
-      1: { halign: "right" },
-      2: { halign: "right" },
-      3: { halign: "right" },
-      4: { halign: "right" },
-      5: { halign: "right" },
-      6: { halign: "right" },
-    },
-  });
-  const y5 = (doc as any).lastAutoTable.finalY + 4;
-  if (y5 < PH - 58) {
-    const img = makeBarChart(
-      res.monthly_pv,
-      res.monthly_cons,
-      M_SHORT,
-      540,
-      160,
-      C.gold,
-      "#2c4a7a",
-      "Production PV vs Consommation — kWh/mois",
-    );
-    doc.addImage(img, "PNG", 14, y5, PW - 28, 47);
-    doc.setFontSize(7);
-    doc.setTextColor(...GRAY);
-    doc.text(
-      `SCR=${res.scr}%  |  Auto-consomme: ${fmt(res.e_self_yr1)} kWh  |  Exporte: ${fmt(res.exported)} kWh  |  T0=${res.t0} DA/kWh`,
-      14,
-      y5 + 51,
-    );
+  const y5=(doc as any).lastAutoTable.finalY+4;
+  if(y5<PH-60){
+    const img=makeBar(res.monthly_pv,res.monthly_cons,M_S,540,150,C.goldL,"#2c4a7a","Production PV vs Consommation — kWh/mois");
+    doc.addImage(img,"PNG",14,y5,PW-28,44);
   }
 
-  // ── P6: Financiers (Eqs 20-32) ────────────────────────────────────────────
-  addPage();
-  hLine(20, "Resultats Financiers (Equations 20-32)");
-  doc.setFontSize(7.5);
-  doc.setTextColor(...GRAY);
-  doc.text(
-    `CAPEX=${fDA(res.capex)} | T0=${res.t0} DA/kWh | r=${fin.r}% | f=${fin.f}% | D=${fin.D}%/an | O&M=${fin.om_rate}% | DS=${fDA(fin.DS)}/an FIXE | Sc2=${fin.subsidy_rate}%`,
-    14,
-    28,
-  );
-  autoTable(doc, {
-    startY: 33,
-    head: [
-      [
-        "Indicateur",
-        "Equation",
-        "Sc1 — Sans subvention",
-        "Sc2 — Avec subvention",
-        "Delta",
-      ],
-    ],
-    body: [
-      [
-        "CAPEX Net",
-        "—",
-        fDA(res.capex),
-        fDA(res.capex_sc2),
-        `-${fDA(res.capex - res.capex_sc2)}`,
-      ],
-      [
-        "Eco. Energie An 1",
-        "Eq.20",
-        fDA(res.yr1_energy_savings),
-        fDA(res.yr1_energy_savings),
-        "—",
-      ],
-      ["+ Eco. Demande DS", "Eq.21", fDA(fin.DS), fDA(fin.DS), "FIXE"],
-      [
-        "= Economies Brutes An 1",
-        "Eq.21",
-        fDA(res.yr1_gross_savings),
-        fDA(res.yr1_gross_savings),
-        "—",
-      ],
-      ["Flux Net An 1", "Eq.22", fDA(res.yr1_net_cf), fDA(res.yr1_net_cf), "—"],
-      [
-        "DRS (Simple Payback)",
-        "Eq.23",
-        `${res.spp_sc1} ans`,
-        `${res.spp_sc2} ans`,
-        `-${(res.spp_sc1 - res.spp_sc2).toFixed(1)} ans`,
-      ],
-      [
-        "DRA (Actualise)",
-        "Eq.29",
-        `${res.dpp_sc1 ?? ">25"} ans`,
-        `${res.dpp_sc2 ?? ">25"} ans`,
-        res.dpp_sc1 && res.dpp_sc2 ? `-${res.dpp_sc1 - res.dpp_sc2} ans` : "—",
-      ],
-      [
-        "VAN (25 ans)",
-        "Eq.27",
-        fDA(res.npv_sc1),
-        fDA(res.npv_sc2),
-        `+${fDA(res.npv_sc2 - res.npv_sc1)}`,
-      ],
-      [
-        "TRI",
-        "Eq.28",
-        `${res.irr_sc1}%`,
-        `${res.irr_sc2}%`,
-        `+${(res.irr_sc2 - res.irr_sc1).toFixed(2)}%`,
-      ],
-      [
-        "IP (Indice Profit.)",
-        "Eq.31",
-        res.pi_sc1.toFixed(3),
-        res.pi_sc2.toFixed(3),
-        `+${(res.pi_sc2 - res.pi_sc1).toFixed(3)}`,
-      ],
-      ["LCOE", "Eq.30", `${res.lcoe} DA/kWh`, `${res.lcoe} DA/kWh`, "—"],
-    ],
-    headStyles: {
-      fillColor: NAVY,
-      textColor: CREAM,
-      fontStyle: "bold",
-      fontSize: 7.5,
-    },
-    bodyStyles: { fontSize: 8 },
-    alternateRowStyles: { fillColor: [254, 252, 232] },
-    columnStyles: {
-      2: { halign: "right" },
-      3: { halign: "right" },
-      4: { halign: "right" },
+  // ── P6: CAPEX ─────────────────────────────────────────────────────────────
+  hdr();sec(20,"Détail CAPEX — Équation 31");
+  autoTable(doc,{startY:27,
+    head:[["Composant","Quantité × Prix unitaire","Montant (DA)","% CAPEX"]],
+    body:res.capex_breakdown.map(r=>[r.label,"",fDA(r.val),(r.val/res.capex*100).toFixed(1)+"%"]),
+    foot:[["CAPEX TOTAL (TTC douanes 5%)","",fDA(res.capex),"100%"]],
+    headStyles:{fillColor:NA,textColor:CR,fontStyle:"bold",fontSize:8},
+    bodyStyles:{fontSize:8},alternateRowStyles:{fillColor:[254,252,232]},
+    footStyles:{fillColor:GO,textColor:NA,fontStyle:"bold",fontSize:8},
+    columnStyles:{2:{halign:"right"},3:{halign:"right"}},
+  });
+  const y6=(doc as any).lastAutoTable.finalY+5;
+  doc.setFontSize(8);doc.setTextColor(...GR);
+  doc.text(`Eq.32 — Coût spécifique: ${res.cost_per_wp} DA/Wc = ${+(res.cost_per_wp/DA_PER_USD).toFixed(2)} USD/Wc`,14,y6);
+  doc.text(`Eq.33 — Remplacement onduleurs An 15: ${fDA(res.inv_replacement)} (inclus dans le modèle DCF)`,14,y6+7);
+  doc.text(`Eq.34 — O&M annuel: ${fDA(res.om_annual)} (${fin.om_rate}% du CAPEX) — maintenance + assurance + nettoyage`,14,y6+14);
+  doc.text(`Scénario 2: Subvention ${fin.subsidy_rate}% PREREC → CAPEX net = ${fDA(res.capex_sc2)}`,14,y6+21);
+  doc.text(`Scénario 3: Crédit ${fin.loan_rate}% sur ${fin.loan_years} ans, apport ${fin.loan_down}% (${fDA(res.capex*fin.loan_down/100)})`,14,y6+28);
+
+  // ── P7: DCF 25 ans ────────────────────────────────────────────────────────
+  hdr();sec(20,"Tableau DCF 25 ans (Eq. 36-47)");
+  doc.setFontSize(6.5);doc.setTextColor(...GR);
+  doc.text("E_n=E_self×(1-D)^(n-1) | T_n=T₀×(1+f)^(n-1) | DS FIXE | An 15: remplacement onduleurs | Vert=DPP",14,27);
+  autoTable(doc,{startY:31,
+    head:[["An","E_self","T_n","Éco.Én.","DS","Brut","O&M","Inv.Repl.","Net CF","DCF","VAN Sc1","VAN Sc2"]],
+    body:res.dcf_table.map(r=>[r.year,fmt(r.e_self_n),r.t_n.toFixed(3),fmt(r.energy_sav),fmt(r.ds),fmt(r.gross_sav),fmt(r.om),r.inv_repl>0?fmt(r.inv_repl):"—",fmt(r.net_cf),fmt(r.dcf),fmt(r.cum_sc1),fmt(r.cum_sc2)]),
+    headStyles:{fillColor:NA,textColor:CR,fontStyle:"bold",fontSize:5.8},
+    bodyStyles:{fontSize:6.2},alternateRowStyles:{fillColor:[254,252,232]},
+    columnStyles:{0:{halign:"center",cellWidth:6},1:{halign:"right"},2:{halign:"right"},3:{halign:"right"},4:{halign:"right"},5:{halign:"right"},6:{halign:"right"},7:{halign:"right"},8:{halign:"right"},9:{halign:"right"},10:{halign:"right"},11:{halign:"right"}},
+    didParseCell:(data)=>{
+      if(data.section!=="body") return;
+      const row=res.dcf_table[data.row.index];
+      if(!row) return;
+      if(row.year===15){data.cell.styles.fillColor=[255,240,220] as any;}
+      if(row.cum_sc1>=0&&data.column.index===10){data.cell.styles.textColor=[22,163,74] as any;data.cell.styles.fontStyle="bold";}
+      if(row.cum_sc2>=0&&data.column.index===11){data.cell.styles.textColor=[37,99,235] as any;data.cell.styles.fontStyle="bold";}
     },
   });
 
-  // ── P7: DCF 25 ans (Eqs 24-29) ────────────────────────────────────────────
-  addPage();
-  hLine(20, "Tableau DCF — 25 ans (Equations 24-29)");
-  doc.setFontSize(7);
-  doc.setTextColor(...GRAY);
-  doc.text(
-    "E_n=E_self×(1-D)^(n-1) Eq.24 | T_n=T0×(1+f)^(n-1) Eq.25 | CF=E_n×T_n+DS-OM Eq.26 | DCF=CF/(1+r)^n Eq.27",
-    14,
-    28,
-  );
-  autoTable(doc, {
-    startY: 33,
-    head: [
-      [
-        "An",
-        "E_self(kWh)",
-        "T_n(DA/kWh)",
-        "Eco.Energ",
-        "DS",
-        "Brut",
-        "O&M",
-        "Net CF",
-        "DCF",
-        "VAN Sc1",
-        "VAN Sc2",
-      ],
+  // ── P8: Financial Summary + NPV Chart ─────────────────────────────────────
+  hdr();sec(20,"Indicateurs Financiers & Évolution VAN (Eq. 42-50)");
+  autoTable(doc,{startY:27,
+    head:[["Indicateur","Équation","Sc1 — Sans subvention","Sc2 — Subvention","Sc3 — Crédit","Delta Sc1/Sc2"]],
+    body:[
+      ["CAPEX Net","—",fDA(res.capex),fDA(res.capex_sc2),fDA(res.capex),`-${fDA(res.capex-res.capex_sc2)}`],
+      ["Éco. énergie An 1","Eq.37",fDA(res.yr1_energy_sav),fDA(res.yr1_energy_sav),"—","—"],
+      ["+ DS (FIXE)","Eq.38",fDA(fin.DS),fDA(fin.DS),"—","FIXE"],
+      ["Éco. brutes An 1","Eq.38",fDA(res.yr1_gross_sav),fDA(res.yr1_gross_sav),"—","—"],
+      ["DRS","Eq.46",`${res.spp_sc1} ans`,`${res.spp_sc2} ans`,"—",`-${(res.spp_sc1-res.spp_sc2).toFixed(1)} ans`],
+      ["NPV","Eq.42",fDA(res.npv_sc1),fDA(res.npv_sc2),fDA(res.npv_sc3),`+${fDA(res.npv_sc2-res.npv_sc1)}`],
+      ["TRI","Eq.48",`${res.irr_sc1}%`,`${res.irr_sc2}%`,`${res.irr_sc3}%`,`+${(res.irr_sc2-res.irr_sc1).toFixed(2)}%`],
+      ["DPP","Eq.47",`${res.dpp_sc1??">25"} ans`,`${res.dpp_sc2??">25"} ans`,`${res.dpp_sc3??">25"} ans`,res.dpp_sc1&&res.dpp_sc2?`-${res.dpp_sc1-res.dpp_sc2} ans`:"—"],
+      ["IP","Eq.50",res.pi_sc1.toString(),res.pi_sc2.toString(),res.pi_sc3.toString(),`+${(res.pi_sc2-res.pi_sc1).toFixed(3)}`],
+      ["LCOE","Eq.49",`${res.lcoe} DA/kWh`,"idem","—","—"],
     ],
-    body: res.dcf_table.map((r) => [
-      r.year,
-      fmt(r.e_self_n),
-      r.t_n.toFixed(4),
-      fmt(r.energy_savings),
-      fmt(r.ds),
-      fmt(r.gross_savings),
-      fmt(r.om),
-      fmt(r.net_cf),
-      fmt(r.dcf),
-      fmt(r.cum_sc1),
-      fmt(r.cum_sc2),
-    ]),
-    headStyles: {
-      fillColor: NAVY,
-      textColor: CREAM,
-      fontStyle: "bold",
-      fontSize: 6,
-    },
-    bodyStyles: { fontSize: 6.5 },
-    alternateRowStyles: { fillColor: [254, 252, 232] },
-    columnStyles: {
-      0: { halign: "center", cellWidth: 7 },
-      1: { halign: "right" },
-      2: { halign: "right" },
-      3: { halign: "right" },
-      4: { halign: "right" },
-      5: { halign: "right" },
-      6: { halign: "right" },
-      7: { halign: "right" },
-      8: { halign: "right" },
-      9: { halign: "right" },
-      10: { halign: "right" },
-    },
-    didParseCell: (data) => {
-      if (data.section !== "body") return;
-      const row = res.dcf_table[data.row.index];
-      if (!row) return;
-      if (row.cum_sc1 >= 0 && data.column.index === 9) {
-        data.cell.styles.textColor = [22, 163, 74];
-        data.cell.styles.fontStyle = "bold";
-      }
-      if (row.cum_sc2 >= 0 && data.column.index === 10) {
-        data.cell.styles.textColor = [37, 99, 235];
-        data.cell.styles.fontStyle = "bold";
-      }
-    },
+    headStyles:{fillColor:NA,textColor:CR,fontStyle:"bold",fontSize:7},
+    bodyStyles:{fontSize:7.5},alternateRowStyles:{fillColor:[254,252,232]},
+    columnStyles:{2:{halign:"right"},3:{halign:"right"},4:{halign:"right"},5:{halign:"right"}},
+  });
+  const y8=(doc as any).lastAutoTable.finalY+4;
+  if(y8<PH-60){
+    const lineImg=makeLine(res.dcf_table.map(r=>r.cum_sc1),res.dcf_table.map(r=>r.cum_sc2),res.dcf_table.map(r=>r.cum_sc3),res.dcf_table.map(r=>String(r.year)),540,180);
+    doc.addImage(lineImg,"PNG",14,y8,PW-28,53);
+  }
+
+  // ── P9: Sensitivity Analysis ──────────────────────────────────────────────
+  hdr();sec(20,"Analyse de Sensibilité (Eq. 51)");
+  doc.setFontSize(8);doc.setTextColor(...GR);
+  doc.text(`Break-even SCR: ${res.be_scr}% — marge de sécurité: ${(res.scr_annual-res.be_scr).toFixed(0)} pts | Break-even T₀: ${res.be_tariff} DA/kWh`,14,28);
+
+  autoTable(doc,{startY:33,
+    head:[["SCR (%)","VAN Sc1 (DA)","SPP (ans)","Statut"]],
+    body:res.sens_scr.map(r=>[r.label,fmt(r.npv),r.spp.toString(),r.npv>0?"✓ Viable":"✗ Non viable"]),
+    headStyles:{fillColor:NA,textColor:CR,fontStyle:"bold",fontSize:8},
+    bodyStyles:{fontSize:8},alternateRowStyles:{fillColor:[254,252,232]},
+    columnStyles:{1:{halign:"right"},2:{halign:"right"}},
+    didParseCell:(d)=>{if(d.section==="body"&&d.column.index===3){d.cell.styles.textColor=(d.cell.text[0].includes("✓")?[22,163,74]:[220,38,38]) as any;}},
+  });
+  const y9a=(doc as any).lastAutoTable.finalY+6;
+  autoTable(doc,{startY:y9a,head:[["GHI (±%)","VAN Sc1 (DA)","Statut"]],
+    body:res.sens_ghi.map(r=>[r.label,fmt(r.npv),r.npv>0?"✓ Viable":"✗"]),
+    headStyles:{fillColor:NA,textColor:CR,fontStyle:"bold",fontSize:8},
+    bodyStyles:{fontSize:8},alternateRowStyles:{fillColor:[254,252,232]},
+    columnStyles:{1:{halign:"right"}},
+  });
+  const y9b=(doc as any).lastAutoTable.finalY+6;
+  autoTable(doc,{startY:y9b,head:[["O&M (%CAPEX)","VAN Sc1 (DA)","Statut"]],
+    body:res.sens_om.map(r=>[r.label,fmt(r.npv),r.npv>0?"✓ Viable":"✗"]),
+    headStyles:{fillColor:NA,textColor:CR,fontStyle:"bold",fontSize:8},
+    bodyStyles:{fontSize:8},alternateRowStyles:{fillColor:[254,252,232]},
+    columnStyles:{1:{halign:"right"}},
   });
 
-  // ── P8: Courbe VAN + SCR bar chart ────────────────────────────────────────
-  addPage();
-  hLine(20, "Evolution VAN Cumulee — 25 ans");
-  const lineImg = makeLineChart(
-    res.dcf_table.map((r) => r.cum_sc1),
-    res.dcf_table.map((r) => r.cum_sc2),
-    res.dcf_table.map((r) => String(r.year)),
-    540,
-    200,
-  );
-  doc.addImage(lineImg, "PNG", 14, 27, PW - 28, 60);
-  doc.setFontSize(8);
-  doc.setTextColor(...GRAY);
-  doc.text(
-    `Sc1: VAN=${fDA(res.npv_sc1)} | TRI=${res.irr_sc1}% | DRA=${res.dpp_sc1 ?? ">25"} ans | IP=${res.pi_sc1}`,
-    14,
-    92,
-  );
-  doc.text(
-    `Sc2: VAN=${fDA(res.npv_sc2)} | TRI=${res.irr_sc2}% | DRA=${res.dpp_sc2 ?? ">25"} ans | IP=${res.pi_sc2}`,
-    14,
-    98,
-  );
-  const scrImg = makeBarChart(
-    res.monthly_scr,
-    null,
-    M_SHORT,
-    540,
-    140,
-    C.gold,
-    C.navy,
-    "SCR% Mensuel (Eq.13): min(E_PV,m, E_cons,m) / E_PV,m",
-  );
-  doc.addImage(scrImg, "PNG", 14, 103, PW - 28, 42);
-
-  // ── P9: Environnement (Eqs 33-35) + Recommandations ──────────────────────
-  addPage();
-  hLine(20, "Impact Environnemental (Equations 33-35)");
-  autoTable(doc, {
-    startY: 27,
-    head: [["Indicateur", "Equation", "An 1", "25 ans", "Reference"]],
-    body: [
-      [
-        "CO2 evite",
-        "Eq.33: E×0.550/1000",
-        `${res.co2_yr1} tCO2`,
-        `${res.co2_25yr} tCO2`,
-        "CREG/IEA Algerie 2023",
-      ],
-      [
-        "Arbres equivalents",
-        "co2_yr1×45",
-        `${res.trees_equiv}`,
-        `${res.trees_equiv * 25}`,
-        "45 arbres/tCO2/an",
-      ],
-      [
-        "Vehicules retires",
-        "co2_yr1/2.3",
-        `${res.vehicles_equiv}`,
-        "—",
-        "2.3 tCO2/vehicule/an",
-      ],
-      [
-        "Surplus exporte",
-        "Eq.16",
-        `${fmt(res.exported)} kWh`,
-        "—",
-        "Loi 04-09 energies renouvelables",
-      ],
-      [
-        "Revenus Net Metering",
-        "Eq.35: E_exp×1.8064",
-        fDA(res.nm_revenue),
-        "—",
-        "Tarif HTA Hors Pointe",
-      ],
+  // ── P10: Environmental ────────────────────────────────────────────────────
+  hdr();sec(20,"Impact Environnemental (Eq. 54-55)");
+  autoTable(doc,{startY:27,
+    head:[["Indicateur","Équation","An 1","25 ans","Référence"]],
+    body:[
+      ["CO₂ évité","Eq.54: E×0.550/1000",`${res.co2_yr1} tCO₂`,`${res.co2_25yr} tCO₂`,"IEA/CREG Algérie 2023"],
+      ["Équivalent arbres","×50 arbres/tCO₂",`${res.trees_yr}`,`${res.trees_yr*25}`,"1 arbre = 20 kgCO₂/an"],
+      ["Véhicules retirés","÷2.3 tCO₂/véhicule",`${res.vehi_yr}`,"—","Voiture passager moy."],
+      ["Gaz naturel économisé","E×0.22 m³",`${res.gas_yr.toLocaleString()} m³`,"—","Équivalent énergie"],
+      ["Surplus exporté (Eq.30)",`→ Net Metering (Eq.52)`,`${fmt(res.e_surplus)} kWh`,`${fDA(res.nm_revenue)}/an`,"Loi 04-09 énergie renouv."],
+      ["VAN Comptage Net (Eq.53)","×Fact.ann.(6%,25yr=12.783)",fDA(res.nm_revenue),fDA(res.npv_nm),"Bonus conservatif"],
     ],
-    headStyles: {
-      fillColor: [21, 73, 44],
-      textColor: [187, 247, 208],
-      fontStyle: "bold",
-      fontSize: 8,
-    },
-    bodyStyles: { fontSize: 8 },
-    alternateRowStyles: { fillColor: [240, 253, 244] },
-    columnStyles: { 2: { halign: "right" }, 3: { halign: "right" } },
+    headStyles:{fillColor:[20,73,44] as any,textColor:[187,247,208] as any,fontStyle:"bold",fontSize:8},
+    bodyStyles:{fontSize:8},alternateRowStyles:{fillColor:[240,253,244]},
+    columnStyles:{2:{halign:"right"},3:{halign:"right"}},
   });
-  const recY = (doc as any).lastAutoTable.finalY + 9;
-  hLine(recY, "Recommandations");
-  const recs = [
-    `Projet VIABLE (Sc1): VAN = ${fDA(res.npv_sc1)} — TRI = ${res.irr_sc1}% >> taux d'actualisation ${fin.r}%`,
-    `SCR reel calcule = ${res.scr}% (methode mensuelle) — plus fiable que la valeur fixe 70% communement utilisee`,
-    `Sc2 (subvention ${fin.subsidy_rate}%): DRS passe de ${res.spp_sc1} a ${res.spp_sc2} ans, VAN +${fDA(res.npv_sc2 - res.npv_sc1)}`,
-    `Mettre en place comptage net (Loi 04-09): ${fmt(res.exported)} kWh/an exportes = ${fDA(res.nm_revenue)} DA/an supplementaires`,
-    `Monitorer la degradation (D=${fin.D}%/an): verifier PR reel apres mise en service et ajuster le plan O&M`,
-    `Surface ${loc.gross_area} m² (${res.a_available} m² nette) accueille ${sys.n_modules} modules (${sys.p_installed} kWp) — ratio ${((sys.p_installed / loc.gross_area) * 1000).toFixed(0)} Wp/m² brut`,
+  const yenv=(doc as any).lastAutoTable.finalY+8;
+  doc.setFontSize(8.5);doc.setTextColor(30,80,50);
+  doc.text(`EPBT (Durée de retour énergétique): 2.5 – 3.0 ans → système carbon-positif pour ${22} ans restants.`,14,yenv);
+  doc.text(`SCR = ${res.scr_annual}% — 404 772 kWh autoconsommés / 53 148 kWh exportés. La méthode mensuelle évite la sous-estimation fixe à 70%.`,14,yenv+8);
+
+  // ── P11: Recommendations ──────────────────────────────────────────────────
+  hdr();sec(20,"Recommandations & Prochaines Étapes");
+  const recs=[
+    `Scénario recommandé: ${res.irr_sc2>res.irr_sc1?"Sc2 (subvention)":"Sc1"} — VAN = ${fDA(res.npv_sc2>res.npv_sc1?res.npv_sc2:res.npv_sc1)}, TRI = ${Math.max(res.irr_sc1,res.irr_sc2)}% >> taux actualisation ${fin.r}%.`,
+    `Déposer dossier PREREC/APRUE pour la subvention ${fin.subsidy_rate}%: réduit le DRS de ${res.spp_sc1} à ${res.spp_sc2} ans et augmente la VAN de +${fDA(res.npv_sc2-res.npv_sc1)}.`,
+    `Protéger le SCR au-dessus de ${res.be_scr}% (SCR actuel = ${res.scr_annual}%, marge ${(res.scr_annual-res.be_scr).toFixed(0)} pts): planifier les activités énergivores de 08h00 à 16h00.`,
+    `Formaliser l'accord de comptage net avec Sonelgaz (Loi 04-09): ${fmt(res.e_surplus)} kWh/an exportés = ${fDA(res.nm_revenue)}/an supplémentaires (NPV bonus ${fDA(res.npv_nm)}).`,
+    `Protocole nettoyage bi-mensuel des modules: chaque 1% de perte PR = ${fmt(Math.round(res.e_annual*0.01))} kWh/an perdu (${fDA(Math.round(res.e_annual*0.01*res.t0))}/an).`,
+    `Installer SCADA/IoT de monitoring en temps réel pour valider les hypothèses et détecter les dégradations précoces.`,
+    `Remplacement onduleurs prévu à l'An 15: ${fDA(res.inv_replacement)} — constituer une provision dès An 10.`,
   ];
-  let ry = recY + 9;
-  recs.forEach((rec, i) => {
-    doc.setFont("helvetica", "bold");
-    doc.setFontSize(8);
-    doc.setTextColor(180, 150, 10);
-    doc.text(`${i + 1}.`, 14, ry);
-    doc.setFont("helvetica", "normal");
-    doc.setTextColor(40, 40, 40);
-    const lines = doc.splitTextToSize(rec, PW - 32) as string[];
-    doc.text(lines, 20, ry);
-    ry += lines.length * 5 + 3;
-    if (ry > PH - 18) {
-      addPage();
-      ry = 20;
-    }
+  let ry=28;
+  recs.forEach((rec,i)=>{
+    doc.setFont("helvetica","bold");doc.setFontSize(8.5);doc.setTextColor(180,140,10);
+    doc.text(`${i+1}.`,14,ry);
+    doc.setFont("helvetica","normal");doc.setTextColor(35,35,35);
+    const lines=doc.splitTextToSize(rec,PW-32) as string[];
+    doc.text(lines,22,ry);ry+=lines.length*5.2+4;
+    if(ry>PH-20){hdr();ry=20;}
   });
+
+  // ── P12: Methodology ──────────────────────────────────────────────────────
+  hdr();sec(20,"Méthodologie & Références — 55 Équations IEC 61724-1:2021");
+  autoTable(doc,{startY:27,
+    head:[["Groupe","Équations","Description"]],
+    body:[
+      ["A — Dimensionnement","Eq.1–8","Surface nette, N_modules, strings, P_installed, onduleurs, DC/AC, transformateur"],
+      ["B — Production","Eq.9–17","T_cell (NOCT), PR_temp, PR_soiling, PR_total, E_PV mensuel, E_annual, FLEH, dégradation"],
+      ["C — Consommation","Eq.18–23","Moyenne multi-annuelle, consommation annuelle, T₀ pondéré, inflation T(n), fraction pointe, DS"],
+      ["D — Autoconsommation","Eq.24–30","E_SC, E_export, E_grid, SCR mensuel, SCR annuel, SSR, surplus exporté"],
+      ["E — CAPEX","Eq.31–33","Décomposition 8 postes + 5% contingences, coût/Wc, remplacement onduleurs An15"],
+      ["F — DCF 25 ans","Eq.34–48","O&M, E_self(n), T(n), éco.énergie, flux nets, DCF, NPV Sc1/Sc2/Sc3, IRR, DPP, SPP"],
+      ["G — LCOE & PI","Eq.49–51","LCOE actualisé, Indice Profitabilité, analyse break-even SCR/T₀/GHI"],
+      ["H — Comptage Net","Eq.52–53","Revenus Net Metering, VAN actualisée sur 25 ans"],
+      ["I — Environnement","Eq.54–55","CO₂ évité An1/25ans, arbres, véhicules, gaz, EPBT"],
+    ],
+    headStyles:{fillColor:NA,textColor:CR,fontStyle:"bold",fontSize:8},
+    bodyStyles:{fontSize:8},alternateRowStyles:{fillColor:[254,252,232]},
+  });
+  const yr=(doc as any).lastAutoTable.finalY+8;
+  autoTable(doc,{startY:yr,
+    head:[["Source","Utilisation","Référence"]],
+    body:[
+      ["IEC 61724-1:2021","Méthode de calcul PR mensuel, FLEH","Standard international"],
+      ["Sonelgaz HTA Tarif 42","Facturation énergie: H.Hors Pointe + H.Pointe","Factures client 2023-2025"],
+      ["NASA POWER","Données GHI et température mensuelles / wilaya","power.larc.nasa.gov"],
+      [`${panel.brand} Datasheet`,`Pnom=${panel.power_wp}Wp, NOCT=${panel.noct}°C, γ=${panel.gamma}%/°C, dégr.=${panel.degradation_yr}%/an`,`${panel.model}`],
+      [`${inv.brand} Datasheet`,`${inv.power_kw}kW AC, η=${inv.efficiency}%, Vdc_max=${inv.max_dc_v}V`,`${inv.model}`],
+      ["IEA Algeria 2023","Facteur d'émission CO₂: 0.550 kgCO₂/kWh","CREG/IEA Algeria Energy Profile"],
+      ["Loi 04-09 Algérie","Comptage net: tarif H.Hors Pointe 1.8064 DA/kWh","Loi sur les énergies renouvelables"],
+    ],
+    headStyles:{fillColor:CR,textColor:NA,fontStyle:"bold",fontSize:8},
+    bodyStyles:{fontSize:7.5},alternateRowStyles:{fillColor:[254,252,232]},
+  });
+  doc.setFontSize(6.5);doc.setTextColor(...GR);
+  doc.text("Avertissement: Cette étude est à titre de pré-faisabilité uniquement. La conception finale nécessite une visite de site, mesures in-situ et étude d'ingénierie détaillée.",14,PH-12);
+
   // Global footer
-  const total = doc.getNumberOfPages();
-  for (let p = 1; p <= total; p++) {
-    doc.setPage(p);
-    doc.setFontSize(7);
-    doc.setTextColor(120, 120, 120);
-    doc.text(
-      "SolarAnalytics.dz | v2.0 | Equations 1-35 | IEC 61724-1:2021 | PRD Biskra 2025-2026",
-      14,
-      PH - 4,
-    );
-    doc.text(`Page ${p}/${total}`, PW - 14, PH - 4, { align: "right" });
+  const total=doc.getNumberOfPages();
+  for(let p=1;p<=total;p++){
+    doc.setPage(p);doc.setFontSize(6.5);doc.setTextColor(120,120,120);
+    doc.text("SolarAnalytics.dz | v3.0 | 55 Équations | IEC 61724-1:2021 | Droits douane 5% inclus | Remplacement onduleurs An15",14,PH-4);
+    doc.text(`Page ${p}/${total}`,PW-14,PH-4,{align:"right"});
   }
-  doc.save(
-    `SolarAnalytics_${loc.building_name.replace(/\s+/g, "_")}_${wilaya.name}_${new Date().getFullYear()}.pdf`,
-  );
+  doc.save(`SolarAnalytics_${loc.institution_name.replace(/\s+/g,"_")}_${wilaya.name_fr}_${new Date().getFullYear()}.pdf`);
 }
 
-// ─── Sonelgaz OCR parser (HTA Tarif 42) ──────────────────────────────────────
-function parseSonelgazBill(
-  text: string,
-  slotIdx: number,
-): { data: BillData; warn: string } {
-  let t = text.replace(/\r\n/g, "\n").replace(/[ \t]+/g, " ");
-  t = t.replace(/(\d) (\d{3})(?=[ ,.\n]|$)/g, "$1$2");
-  t = t.replace(/(\d) (\d{3})(?=[ ,.\n]|$)/g, "$1$2");
-  t = t.replace(/(\d),(\d{2})(?!\d)/g, "$1.$2");
-  const lines = t
-    .split("\n")
-    .map((l) => l.trim())
-    .filter((l) => l.length > 0);
-  const toNum = (s: string) => {
-    const v = parseFloat(s.replace(/\s/g, "").replace(",", "."));
-    return isNaN(v) ? 0 : v;
-  };
-  const numsIn = (s: string) =>
-    [...s.matchAll(/\d+(?:\.\d{1,2})?/g)].map((m) => toNum(m[0]));
-  const findAfter = (src: string, kws: RegExp[]) => {
-    for (const kw of kws) {
-      const m = src.match(kw);
-      if (m && m[1]) {
-        const v = toNum(m[1]);
-        if (v > 0) return v;
-      }
-    }
-    return 0;
-  };
-  let c1 = 0,
-    c2 = 0,
-    c3 = 0;
-  c1 = findAfter(t, [
-    /[Cc]adran\s*1[^\d\n]{0,60}(\d{3,6}(?:\.\d{1,2})?)/,
-    /\bC1\b[^\d\n]{0,30}(\d{3,6}(?:\.\d{1,2})?)/,
-  ]);
-  c2 = findAfter(t, [
-    /[Cc]adran\s*2[^\d\n]{0,60}(\d{3,6}(?:\.\d{1,2})?)/,
-    /\bC2\b[^\d\n]{0,30}(\d{3,6}(?:\.\d{1,2})?)/,
-  ]);
-  c3 = findAfter(t, [
-    /[Cc]adran\s*3[^\d\n]{0,60}(\d{3,6}(?:\.\d{1,2})?)/,
-    /\bC3\b[^\d\n]{0,30}(\d{3,6}(?:\.\d{1,2})?)/,
-  ]);
-  if (c1 === 0 && c2 === 0) {
-    for (let i = 0; i < lines.length - 1; i++) {
-      const lo = lines[i].toLowerCase();
-      if (lo.includes("cadran") && lo.includes("1")) {
-        const nums = numsIn(lines[i + 1]).filter((n) => n >= 50 && n <= 999999);
-        if (nums.length >= 3) {
-          c1 = nums[0];
-          c2 = nums[1];
-          c3 = nums[2];
-        } else if (nums.length === 2) {
-          c1 = nums[0];
-          c2 = nums[1];
-        } else if (nums.length === 1) c1 = nums[0];
-        break;
-      }
-    }
-  }
-  let hpP = 0,
-    pP = 0;
-  const plm = t.match(
-    /H[.\s]*Pointe.*?(\d{3,6}(?:\.\d{1,2})?).*?Pointe.*?(\d{2,5}(?:\.\d{1,2})?)/i,
-  );
-  if (plm) {
-    hpP = toNum(plm[1]);
-    pP = toNum(plm[2]);
-  }
-  if (hpP === 0)
-    hpP = findAfter(t, [
-      /H(?:eures?\s+)?(?:H(?:ors)?\s+)?Pointe[^\d\n]{0,30}(\d{3,6}(?:\.\d{1,2})?)/i,
-      /HHP[^\d\n]{0,20}(\d{3,6}(?:\.\d{1,2})?)/i,
-    ]);
-  let hp_kwh = 0,
-    peak_kwh = 0;
-  if (c1 > 0 || c2 > 0 || c3 > 0) {
-    hp_kwh = c1 + c2;
-    peak_kwh = c3;
-    if (hp_kwh === 0 && peak_kwh > 0) {
-      hp_kwh = peak_kwh;
-      peak_kwh = 0;
-    }
-  } else if (hpP > 0 || pP > 0) {
-    hp_kwh = hpP;
-    peak_kwh = pP;
-  } else {
-    const all = lines.flatMap((l) =>
-      numsIn(l).filter((n) => n >= 100 && n <= 99999),
-    );
-    const uniq = [...new Set(all)].sort((a, b) => b - a);
-    if (uniq.length >= 2) {
-      hp_kwh = uniq[0];
-      peak_kwh = uniq[1];
-    } else if (uniq.length === 1) hp_kwh = uniq[0];
-  }
-  let total_da = 0;
-  const totalKws = [
-    /TOTAL\s*FACTURE[^\d\n]{0,20}(\d{4,9}(?:\.\d{1,2})?)/i,
-    /Net\s+[àa]\s+Payer[^\d\n]{0,20}(\d{4,9}(?:\.\d{1,2})?)/i,
-    /Montant\s+Net[^\d\n]{0,20}(\d{4,9}(?:\.\d{1,2})?)/i,
-    /Total\s+TTC[^\d\n]{0,20}(\d{4,9}(?:\.\d{1,2})?)/i,
-    /NET\s+A\s+PAYER[^\d\n]{0,20}(\d{4,9}(?:\.\d{1,2})?)/i,
-  ];
-  total_da = findAfter(t, totalKws);
-  if (total_da === 0) {
-    for (let i = 0; i < lines.length; i++) {
-      const lo = lines[i].toLowerCase();
-      if (
-        (lo.includes("total") && lo.includes("facture")) ||
-        lo.includes("net a payer") ||
-        (lo.includes("montant") && lo.includes("net"))
-      ) {
-        const sn = numsIn(lines[i]).filter((n) => n > 1000);
-        if (sn.length) {
-          total_da = sn[sn.length - 1];
-          break;
-        }
-        if (i + 1 < lines.length) {
-          const nn = numsIn(lines[i + 1]).filter((n) => n > 1000);
-          if (nn.length) {
-            total_da = nn[0];
-            break;
-          }
-        }
-      }
-    }
-  }
-  if (total_da === 0) {
-    const big = lines
-      .flatMap((l) => numsIn(l))
-      .filter((n) => n > 5000 && n < 5_000_000)
-      .sort((a, b) => b - a);
-    if (big.length) total_da = big[0];
-  }
-  const MM: Record<string, number> = {
-    janvier: 1,
-    fevrier: 2,
-    février: 2,
-    mars: 3,
-    avril: 4,
-    mai: 5,
-    juin: 6,
-    juillet: 7,
-    aout: 8,
-    août: 8,
-    septembre: 9,
-    octobre: 10,
-    novembre: 11,
-    decembre: 12,
-    décembre: 12,
-    jan: 1,
-    fev: 2,
-    fév: 2,
-    mar: 3,
-    avr: 4,
-    jun: 6,
-    jul: 7,
-    sep: 9,
-    oct: 10,
-    nov: 11,
-    dec: 12,
-    déc: 12,
-  };
-  let month = slotIdx + 1,
-    year = new Date().getFullYear();
-  const mk = Object.keys(MM).join("|");
-  const mRe = new RegExp(`\\b(${mk})\\b[\\s,.-]{0,5}(20\\d{2})`, "i");
-  const mMatch = t.match(mRe);
-  if (mMatch) {
-    month = MM[mMatch[1].toLowerCase()] ?? month;
-    year = parseInt(mMatch[2]);
-  } else {
-    const nr = t.match(/\b(0?[1-9]|1[0-2])[\/\-](20\d{2})\b/);
-    if (nr) {
-      month = parseInt(nr[1]);
-      year = parseInt(nr[2]);
-    }
-  }
-  const yMatch = t.match(/\b(202\d)\b/);
-  if (yMatch && year === new Date().getFullYear()) year = parseInt(yMatch[1]);
-  const warns: string[] = [];
-  if (hp_kwh === 0 && peak_kwh === 0) warns.push("Consommation non detectee");
-  if (total_da === 0) warns.push("Montant non detecte");
-  if (!mMatch) warns.push("Mois/annee non detectes");
-  return {
-    data: {
-      hp_kwh: Math.round(hp_kwh),
-      peak_kwh: Math.round(peak_kwh),
-      total_da: Math.round(total_da),
-      month,
-      year,
-    },
-    warn: warns.join(" | "),
-  };
-}
-
-// ─── Default values ───────────────────────────────────────────────────────────
+// ─── Defaults ─────────────────────────────────────────────────────────────────
 const DEFAULT_LOC: LocationParams = {
-  wilaya_id: 7,
-  building_name: "Faculte des Sciences et Technologies",
-  building_address: "Universite de Biskra",
-  gross_area: 3065,
+  wilaya_id:7, institution_name:"Faculté des Sciences et Technologies",
+  institution_type:"university", address:"Université de Biskra",
+  gross_area:3065, n_buildings:2, tilt:30, orientation:"Sud", cleaning_freq:"bimonthly",
 };
+const DEFAULT_EQ: EquipmentParams = { panel_id:"jinko_370", inverter_id:"sma_50" };
 const DEFAULT_FIN: FinancialParams = {
-  r: 6,
-  f: 4,
-  D: 0.5,
-  om_rate: 1,
-  DS: 120000,
-  subsidy_rate: 20,
+  r:6, f:4, D:0.5, om_rate:1, DS:120000,
+  subsidy_rate:20, loan_rate:6.5, loan_years:15, loan_down:20,
 };
-const emptySlot = (): BillSlot => ({
-  file: null,
-  preview: null,
-  status: "empty",
-  data: null,
-  edited: null,
-  ocrWarn: "",
-});
+const emptySlot=():InvoiceSlot=>({file:null,preview:null,status:"empty",data:null,edited:null,warn:""});
 
-function sysFromSizing(loc: LocationParams): SystemParams {
-  const w = WILAYAS.find((w) => w.id === loc.wilaya_id) ?? WILAYAS[6];
-  const s = autoSize(loc.gross_area, w.ghi_yr);
-  return {
-    p_installed: s.p_installed,
-    n_modules: s.n_modules,
-    n_inverters: s.n_inverters,
-    module_brand: "Jinko Solar",
-    module_model: "JKM370M-72",
-    module_power: 370,
-    inverter_brand: "SMA Sunny Tripower STP 50-40",
-    tilt: 30,
-    orientation: "Sud",
-    pr: 80,
-    a_available: parseFloat((loc.gross_area * SF).toFixed(2)),
-    c_modules: s.c_modules,
-    c_inverters: s.c_inverters,
-    c_structure: s.c_structure,
-    c_cabling: s.c_cabling,
-    c_transform: s.c_transform,
-    c_labor: s.c_labor,
-    c_eng: s.c_eng,
-  };
-}
-
-// ─────────────────────────────────────────────────────────────────────────────
+// ══════════════════════════════════════════════════════════════════════════════
 //  MAIN COMPONENT
-// ─────────────────────────────────────────────────────────────────────────────
+// ══════════════════════════════════════════════════════════════════════════════
 export default function SolarStudyPro() {
-  const [step, setStep] = useState(0);
-  const [loc, setLoc] = useState<LocationParams>(DEFAULT_LOC);
-  const [bills, setBills] = useState<BillSlot[]>(
-    Array.from({ length: 12 }, emptySlot),
-  );
-  const [sys, setSys] = useState<SystemParams>(sysFromSizing(DEFAULT_LOC));
-  const [fin, setFin] = useState<FinancialParams>(DEFAULT_FIN);
-  const [results, setResults] = useState<StudyResults | null>(null);
-  const [computing, setComputing] = useState(false);
-  const [genPdf, setGenPdf] = useState(false);
-  const [wilayaSearch, setWilayaSearch] = useState("");
-  const fileRefs = useRef<(HTMLInputElement | null)[]>([]);
+  const [step,setStep]=useState(0);
+  const [loc,setLoc]=useState<LocationParams>(DEFAULT_LOC);
+  const [eq,setEq]=useState<EquipmentParams>(DEFAULT_EQ);
+  const [invoices,setInvoices]=useState<InvoiceSlot[]>(Array.from({length:24},emptySlot));
+  const [fin,setFin]=useState<FinancialParams>(DEFAULT_FIN);
+  const [results,setResults]=useState<StudyResults|null>(null);
+  const [computing,setComputing]=useState(false);
+  const [genPdf,setGenPdf]=useState(false);
+  const [wilSearch,setWilSearch]=useState("");
+  const fileRefs=useRef<(HTMLInputElement|null)[]>([]);
+  const selectedWilaya=WILAYAS.find(w=>w.id===loc.wilaya_id)??WILAYAS[6];
+  const selectedPanel=PANEL_CATALOG.find(p=>p.id===eq.panel_id)??PANEL_CATALOG[0];
+  const selectedInv=INVERTER_CATALOG.find(i=>i.id===eq.inverter_id)??INVERTER_CATALOG[0];
 
-  const selectedWilaya =
-    WILAYAS.find((w) => w.id === loc.wilaya_id) ?? WILAYAS[6];
-
-  const updateLoc = (update: Partial<LocationParams>) => {
-    const newLoc = { ...loc, ...update };
-    setLoc(newLoc);
-    setSys(sysFromSizing(newLoc));
-  };
-
-  const processImage = useCallback(async (file: File, idx: number) => {
-    setBills((prev) => {
-      const next = [...prev];
-      next[idx] = {
-        ...next[idx],
-        file,
-        preview: URL.createObjectURL(file),
-        status: "processing",
-        ocrWarn: "",
-      };
-      return next;
-    });
+  // ── Claude Vision OCR (Anthropic API) ────────────────────────────────────
+  const processImage=useCallback(async(file:File,idx:number)=>{
+    setInvoices(prev=>{const n=[...prev];n[idx]={...n[idx],file,preview:URL.createObjectURL(file),status:"processing",warn:""};return n;});
     try {
-      const {
-        data: { text },
-      } = await Tesseract.recognize(file, "fra", { logger: () => {} });
-      const { data, warn } = parseSonelgazBill(text, idx);
-      setBills((prev) => {
-        const next = [...prev];
-        next[idx] = {
-          ...next[idx],
-          status: "done",
-          data,
-          edited: { ...data },
-          ocrWarn: warn,
-        };
-        return next;
+      const b64=await new Promise<string>((res,rej)=>{
+        const r=new FileReader();r.onload=()=>res((r.result as string).split(",")[1]);
+        r.onerror=()=>rej(new Error("Read failed"));r.readAsDataURL(file);
       });
-    } catch {
-      const fb: BillData = {
-        hp_kwh: 0,
-        peak_kwh: 0,
-        total_da: 0,
-        month: idx + 1,
-        year: new Date().getFullYear(),
-      };
-      setBills((prev) => {
-        const next = [...prev];
-        next[idx] = {
-          ...next[idx],
-          status: "done",
-          data: fb,
-          edited: { ...fb },
-          ocrWarn: "OCR echoue — saisie manuelle",
-        };
-        return next;
+      const mediaType=file.type==="image/png"?"image/png":"image/jpeg";
+      const response=await fetch("https://api.anthropic.com/v1/messages",{
+        method:"POST",
+        headers:{"Content-Type":"application/json"},
+        body:JSON.stringify({
+          model:"claude-sonnet-4-20250514",max_tokens:500,
+          messages:[{role:"user",content:[
+            {type:"image",source:{type:"base64",media_type:mediaType,data:b64}},
+            {type:"text",text:`You are a specialized OCR for Algerian Sonelgaz HTA Tarif 42 electricity invoices (French/Arabic).
+Extract EXACTLY these 6 fields and return ONLY valid JSON — no markdown, no explanation:
+{"billing_period":"YYYY-MM","h_pointe_kwh":<number>,"peak_kwh":<number>,"total_kwh":<number>,"invoice_da":<number>,"eff_tariff":<number>}
+DEFINITIONS: billing_period=month this invoice covers (YYYY-MM). h_pointe_kwh=Heures Hors Pointe=Cadran1+Cadran2 (off-peak kWh). peak_kwh=Heures de Pointe=Cadran3 (super-peak 17h-21h kWh). total_kwh=h_pointe_kwh+peak_kwh. invoice_da=Net à Payer total in DA. eff_tariff=invoice_da/total_kwh.
+VALIDATION: h_pointe_kwh>peak_kwh always. eff_tariff typically 4.5-5.6 DA/kWh. If unreadable set null.
+Return ONLY the JSON.`}
+          ]}]
+        })
       });
+      const raw=await response.json();
+      const text=raw.content?.filter((c:any)=>c.type==="text").map((c:any)=>c.text).join("")||"{}";
+      const clean=text.replace(/```json?/g,"").replace(/```/g,"").trim();
+      let data:InvoiceData;
+      try { data=JSON.parse(clean); } catch { throw new Error("JSON parse failed"); }
+      const warns:string[]=[];
+      if(!data.billing_period) warns.push("Période non détectée");
+      if(!data.h_pointe_kwh) warns.push("HHP non détecté");
+      if(!data.invoice_da) warns.push("Montant non détecté");
+      if(data.eff_tariff&&(data.eff_tariff<4.0||data.eff_tariff>6.5)) warns.push(`Tarif ${data.eff_tariff?.toFixed(2)} hors plage`);
+      setInvoices(prev=>{const n=[...prev];n[idx]={...n[idx],status:"done",data,edited:{...data},warn:warns.join(" | ")};return n;});
+    } catch(e) {
+      const fb:InvoiceData={billing_period:"",h_pointe_kwh:0,peak_kwh:0,total_kwh:0,invoice_da:0,eff_tariff:0};
+      setInvoices(prev=>{const n=[...prev];n[idx]={...n[idx],status:"error",data:fb,edited:{...fb},warn:"OCR échoué — saisie manuelle requise"};return n;});
     }
-  }, []);
+  },[]);
 
-  const manualSlot = (idx: number) => {
-    const fb: BillData = {
-      hp_kwh: 0,
-      peak_kwh: 0,
-      total_da: 0,
-      month: idx + 1,
-      year: new Date().getFullYear(),
-    };
-    setBills((prev) => {
-      const next = [...prev];
-      next[idx] = {
-        ...next[idx],
-        status: "done",
-        data: fb,
-        edited: { ...fb },
-        ocrWarn: "Saisie manuelle",
-      };
-      return next;
+  const manualSlot=(idx:number)=>{
+    const fb:InvoiceData={billing_period:"",h_pointe_kwh:0,peak_kwh:0,total_kwh:0,invoice_da:0,eff_tariff:0};
+    setInvoices(prev=>{const n=[...prev];n[idx]={...n[idx],status:"done",data:fb,edited:{...fb},warn:"Saisie manuelle"};return n;});
+  };
+  const updInv=(idx:number,field:keyof InvoiceData,val:any)=>{
+    setInvoices(prev=>{
+      const n=[...prev];if(!n[idx].edited) return n;
+      const ed={...n[idx].edited!,[field]:val};
+      if(field==="h_pointe_kwh"||field==="peak_kwh") ed.total_kwh=(ed.h_pointe_kwh||0)+(ed.peak_kwh||0);
+      if(ed.total_kwh>0&&ed.invoice_da>0) ed.eff_tariff=+(ed.invoice_da/ed.total_kwh).toFixed(3);
+      n[idx]={...n[idx],edited:ed};return n;
     });
   };
 
-  const updField = (idx: number, field: keyof BillData, value: number) => {
-    setBills((prev) => {
-      const next = [...prev];
-      if (next[idx].edited)
-        next[idx] = {
-          ...next[idx],
-          edited: { ...next[idx].edited!, [field]: value },
-        };
-      return next;
-    });
-  };
+  const doneBills=invoices.filter(s=>s.status==="done"||s.status==="error").length;
 
-  const doneBills = bills.filter((b) => b.status === "done").length;
-
-  const compute = () => {
+  const compute=()=>{
     setComputing(true);
-    setTimeout(() => {
-      setResults(runStudy(loc, bills, sys, fin));
-      setComputing(false);
-      setStep(5);
-    }, 400);
+    setTimeout(()=>{setResults(runStudy(loc,eq,invoices,fin));setComputing(false);setStep(6);},500);
+  };
+  const dlPDF=()=>{
+    if(!results) return;setGenPdf(true);
+    setTimeout(()=>{generatePDF(results,loc,eq,fin);setGenPdf(false);},150);
   };
 
-  const downloadPDF = () => {
-    if (!results) return;
-    setGenPdf(true);
-    setTimeout(() => {
-      generatePDF(results, loc, sys, fin);
-      setGenPdf(false);
-    }, 100);
-  };
-
-  // ── Shared UI atoms ────────────────────────────────────────────────────────
-  const inputCls = "w-full px-3 py-2 rounded-lg text-sm outline-none";
-  const inputStyle = {
-    backgroundColor: C.navy,
-    border: `1px solid ${C.border}`,
-    color: C.light,
-  };
-  const NF = ({
-    label,
-    value,
-    onChange,
-    step: s = 1,
-    hint,
-    unit,
-  }: {
-    label: string;
-    value: number;
-    onChange: (v: number) => void;
-    step?: number;
-    hint?: string;
-    unit?: string;
-  }) => (
-    <div>
-      <label className="block text-xs mb-1" style={{ color: C.muted }}>
-        {label}
-      </label>
-      <div className="flex gap-2 items-center">
-        <input
-          type="number"
-          value={value}
-          step={s}
-          onChange={(e) => onChange(parseFloat(e.target.value) || 0)}
-          className={inputCls}
-          style={inputStyle}
-        />
-        {unit && (
-          <span className="text-xs whitespace-nowrap" style={{ color: C.gold }}>
-            {unit}
-          </span>
-        )}
-      </div>
-      {hint && (
-        <p className="text-xs mt-0.5" style={{ color: C.muted + "80" }}>
-          {hint}
-        </p>
-      )}
-    </div>
+  // ── Shared atoms ──────────────────────────────────────────────────────────
+  const iSt={backgroundColor:C.navy,border:`1px solid ${C.border}`,color:C.light};
+  const iCls="w-full px-3 py-2 rounded-xl text-sm outline-none";
+  const NF=({label,value,onChange,step:s=1,hint,unit}:{label:string;value:number;onChange:(v:number)=>void;step?:number;hint?:string;unit?:string})=>(
+    <div><label className="block text-xs mb-1" style={{color:C.muted}}>{label}</label>
+    <div className="flex gap-2 items-center">
+      <input type="number" value={value} step={s} onChange={e=>onChange(parseFloat(e.target.value)||0)} className={iCls} style={iSt}/>
+      {unit&&<span className="text-xs shrink-0" style={{color:C.gold}}>{unit}</span>}
+    </div>{hint&&<p className="text-xs mt-0.5" style={{color:C.muted+"80"}}>{hint}</p>}</div>
   );
-  const TF = ({
-    label,
-    value,
-    onChange,
-  }: {
-    label: string;
-    value: string;
-    onChange: (v: string) => void;
-  }) => (
-    <div>
-      <label className="block text-xs mb-1" style={{ color: C.muted }}>
-        {label}
-      </label>
-      <input
-        type="text"
-        value={value}
-        onChange={(e) => onChange(e.target.value)}
-        className={inputCls}
-        style={inputStyle}
-      />
-    </div>
+  const TF=({label,value,onChange}:{label:string;value:string;onChange:(v:string)=>void})=>(
+    <div><label className="block text-xs mb-1" style={{color:C.muted}}>{label}</label>
+    <input type="text" value={value} onChange={e=>onChange(e.target.value)} className={iCls} style={iSt}/></div>
   );
-  const Card = ({
-    title,
-    children,
-    accent = C.gold,
-  }: {
-    title: string;
-    children: React.ReactNode;
-    accent?: string;
-  }) => (
-    <div
-      className="rounded-2xl p-5 border"
-      style={{ backgroundColor: C.navy2, borderColor: C.border }}
-    >
-      <div className="text-xs font-bold tracking-widest mb-4 uppercase flex items-center gap-2">
-        <span
-          style={{
-            width: 3,
-            height: 14,
-            backgroundColor: accent,
-            display: "inline-block",
-            borderRadius: 2,
-          }}
-        />
-        <span style={{ color: accent }}>{title}</span>
+  const SF2=({label,value,onChange,opts}:{label:string;value:string;onChange:(v:string)=>void;opts:{v:string;l:string}[]})=>(
+    <div><label className="block text-xs mb-1" style={{color:C.muted}}>{label}</label>
+    <select value={value} onChange={e=>onChange(e.target.value)} className={iCls} style={{...iSt,appearance:"none"}}>
+      {opts.map(o=><option key={o.v} value={o.v}>{o.l}</option>)}
+    </select></div>
+  );
+  const Card=({title,children,accent=C.gold}:{title:string;children:React.ReactNode;accent?:string})=>(
+    <div className="rounded-2xl p-5 border" style={{backgroundColor:C.navy2,borderColor:C.border}}>
+      <div className="text-xs font-bold tracking-[0.2em] mb-4 uppercase flex items-center gap-2">
+        <span style={{width:3,height:14,backgroundColor:accent,display:"inline-block",borderRadius:2}}/>
+        <span style={{color:accent}}>{title}</span>
       </div>
       <div className="space-y-3">{children}</div>
     </div>
   );
-
-  const WH = ({ s, t, sub }: { s: number; t: string; sub: string }) => (
+  const WH=({s,t,sub}:{s:number;t:string;sub:string})=>(
     <div className="max-w-4xl mx-auto mb-6">
-      <div className="flex gap-1.5 mb-4">
-        {[1, 2, 3, 4, 5].map((i) => (
-          <div
-            key={i}
-            className="flex-1 h-1.5 rounded-full transition-all duration-500"
-            style={{ backgroundColor: i <= s ? C.gold : C.gold + "22" }}
-          />
-        ))}
+      <div className="flex gap-1 mb-4">
+        {[1,2,3,4,5,6].map(i=><div key={i} className="flex-1 h-1.5 rounded-full transition-all duration-500"
+          style={{backgroundColor:i<=s?C.gold:C.gold+"22"}}/>)}
       </div>
-      <div
-        className="text-xs tracking-[0.3em] font-semibold mb-1"
-        style={{ color: C.gold + "80" }}
-      >
-        ETAPE {s} / 5
-      </div>
-      <h2 className="text-2xl font-bold" style={{ color: C.light }}>
-        {t}
-      </h2>
-      <p className="text-sm mt-1" style={{ color: C.muted }}>
-        {sub}
-      </p>
+      <div className="text-xs tracking-[0.3em] font-semibold mb-1" style={{color:C.gold+"80"}}>ÉTAPE {s}/6</div>
+      <h2 className="text-2xl font-bold" style={{color:C.light}}>{t}</h2>
+      <p className="text-sm mt-1" style={{color:C.muted}}>{sub}</p>
     </div>
   );
-
-  const NavBtns = ({
-    onBack,
-    onNext,
-    nextLabel,
-    disabled,
-  }: {
-    onBack: () => void;
-    onNext: () => void;
-    nextLabel: string;
-    disabled?: boolean;
-  }) => (
+  const NB=({onBack,onNext,nextLabel,disabled}:{onBack:()=>void;onNext:()=>void;nextLabel:string;disabled?:boolean})=>(
     <div className="flex gap-3">
-      <button
-        onClick={onBack}
-        className="flex-1 py-3 rounded-xl text-sm"
-        style={{ border: `1px solid ${C.border}`, color: C.muted }}
-      >
-        Retour
-      </button>
-      <button
-        onClick={onNext}
-        disabled={disabled}
+      <button onClick={onBack} className="flex-1 py-3 rounded-xl text-sm" style={{border:`1px solid ${C.border}`,color:C.muted}}>Retour</button>
+      <button onClick={onNext} disabled={disabled}
         className="flex-grow py-3 rounded-xl font-bold transition-opacity hover:opacity-90 disabled:opacity-30"
-        style={{ backgroundColor: C.gold, color: C.navy }}
-      >
-        {nextLabel}
-      </button>
+        style={{backgroundColor:C.gold,color:C.navy}}>{nextLabel}</button>
     </div>
   );
 
   // ── STEP 0: Welcome ────────────────────────────────────────────────────────
-  if (step === 0)
-    return (
-      <div
-        style={{ backgroundColor: C.navy, minHeight: "100vh" }}
-        className="flex items-center justify-center p-6"
-      >
-        <div className="max-w-lg w-full">
-          <div className="mb-3">
-            <span
-              className="text-xs tracking-[0.35em] font-bold px-3 py-1 rounded-full border"
-              style={{ color: C.gold, borderColor: C.gold + "40" }}
-            >
-              SOLARANALYTICS.DZ — v2.0
-            </span>
-          </div>
-          <h1
-            className="text-4xl font-black mt-5 mb-3 leading-[1.1]"
-            style={{ color: C.light }}
-          >
-            Etude
-            <br />
-            <span style={{ color: C.gold }}>Technico-Economique PV</span>
-          </h1>
-          <p
-            className="mb-8 leading-relaxed text-sm"
-            style={{ color: C.muted }}
-          >
-            Selectionnez votre wilaya, entrez la surface de toiture, importez
-            vos factures Sonelgaz. Le moteur execute les 35 equations et genere
-            un rapport bancable PDF complet.
-          </p>
-          <div className="grid grid-cols-2 gap-3 mb-8">
-            {[
-              ["35 Equations", "IEC 61724-1:2021 complet"],
-              ["58 Wilayas", "GHI par zone climatique"],
-              ["OCR Tesseract", "Extraction auto des factures"],
-              ["Rapport 9 pages", "DCF 25 ans, VAN, TRI, LCOE"],
-            ].map(([t, s]) => (
-              <div
-                key={t}
-                className="rounded-xl p-4 border"
-                style={{ backgroundColor: C.navy2, borderColor: C.border }}
-              >
-                <div
-                  className="font-bold text-xs mb-1"
-                  style={{ color: C.gold }}
-                >
-                  {t}
-                </div>
-                <div className="text-xs" style={{ color: C.muted }}>
-                  {s}
-                </div>
-              </div>
-            ))}
-          </div>
-          <button
-            onClick={() => setStep(1)}
-            className="w-full py-4 rounded-xl font-bold text-base transition-opacity hover:opacity-90"
-            style={{ backgroundColor: C.gold, color: C.navy }}
-          >
-            Demarrer l&apos;etude →
-          </button>
-        </div>
-      </div>
-    );
-
-  // ── STEP 1: Localisation & Dimensionnement ─────────────────────────────────
-  if (step === 1) {
-    const sizing = autoSize(loc.gross_area, selectedWilaya.ghi_yr);
-    const filteredWilayas = wilayaSearch
-      ? WILAYAS.filter((w) =>
-          w.name.toLowerCase().includes(wilayaSearch.toLowerCase()),
-        )
-      : WILAYAS;
-    return (
-      <div
-        style={{ backgroundColor: C.navy, minHeight: "100vh" }}
-        className="p-5"
-      >
-        <WH
-          s={1}
-          t="Localisation & Dimensionnement"
-          sub="Choisissez la wilaya et saisissez la surface brute de toiture"
-        />
-        <div className="max-w-3xl mx-auto space-y-5">
-          <Card title="Projet">
-            <TF
-              label="Nom du bâtiment / projet"
-              value={loc.building_name}
-              onChange={(v) => setLoc({ ...loc, building_name: v })}
-            />
-            <TF
-              label="Adresse"
-              value={loc.building_address}
-              onChange={(v) => setLoc({ ...loc, building_address: v })}
-            />
-          </Card>
-
-          <Card title="Wilaya — GHI Solaire">
-            <div>
-              <label className="block text-xs mb-1" style={{ color: C.muted }}>
-                Rechercher une wilaya
-              </label>
-              <input
-                type="text"
-                placeholder="ex: Biskra, Alger, Adrar..."
-                value={wilayaSearch}
-                onChange={(e) => setWilayaSearch(e.target.value)}
-                className={inputCls}
-                style={inputStyle}
-              />
+  if(step===0) return(
+    <div style={{backgroundColor:C.bg,minHeight:"100vh"}} className="flex items-center justify-center p-6">
+      <div className="max-w-lg w-full">
+        <div className="mb-4"><span className="text-xs tracking-[0.4em] font-bold px-3 py-1 rounded-full border"
+          style={{color:C.gold,borderColor:C.gold+"40"}}>SOLARANALYTICS.DZ — v3.0</span></div>
+        <h1 className="text-4xl font-black mt-5 mb-4 leading-[1.1]" style={{color:C.light}}>
+          Étude PV<br/><span style={{color:C.gold}}>Technico-Économique</span><br/>
+          <span style={{fontSize:"1.1rem",fontWeight:500,color:C.muted}}>Algérie — 55 Équations IEC 61724</span>
+        </h1>
+        <p className="mb-8 leading-relaxed text-sm" style={{color:C.muted}}>
+          Choisissez votre wilaya + surface toiture, sélectionnez les équipements, importez vos factures Sonelgaz.
+          Le moteur exécute les 55 équations et génère un rapport PDF professionnel de 12 pages avec 3 scénarios.
+        </p>
+        <div className="grid grid-cols-2 gap-3 mb-8">
+          {[["55 Équations","IEC 61724-1:2021 complet"],["Claude Vision OCR","Lecture factures HTA/Arabe+Français"],
+            ["3 Scénarios","Sans/Avec subvention/Crédit bancaire"],["Rapport 12p PDF","DCF 25 ans + Sensibilité + Env."]
+          ].map(([t,s])=>(
+            <div key={t} className="rounded-xl p-4 border" style={{backgroundColor:C.navy2,borderColor:C.border}}>
+              <div className="font-bold text-xs mb-1" style={{color:C.gold}}>{t}</div>
+              <div className="text-xs" style={{color:C.muted}}>{s}</div>
             </div>
-            <div
-              className="grid grid-cols-3 gap-1.5 max-h-52 overflow-y-auto pr-1"
-              style={{ scrollbarWidth: "thin" }}
-            >
-              {filteredWilayas.map((w) => (
-                <button
-                  key={w.id}
-                  onClick={() => updateLoc({ wilaya_id: w.id })}
-                  className="text-left p-2.5 rounded-lg border text-xs transition-all"
-                  style={{
-                    backgroundColor:
-                      loc.wilaya_id === w.id ? C.gold + "22" : C.navy,
-                    borderColor: loc.wilaya_id === w.id ? C.gold : C.border,
-                    color: loc.wilaya_id === w.id ? C.gold : C.muted,
-                  }}
-                >
-                  <span className="font-semibold block">{w.name}</span>
-                  <span
-                    style={{
-                      color: loc.wilaya_id === w.id ? C.gold : C.muted + "70",
-                    }}
-                  >
-                    {w.ghi_yr} kWh/m²/an
-                  </span>
+          ))}
+        </div>
+        <button onClick={()=>setStep(1)} className="w-full py-4 rounded-xl font-bold text-base transition-opacity hover:opacity-90"
+          style={{backgroundColor:C.gold,color:C.navy}}>Démarrer l&apos;étude →</button>
+        <p className="text-center text-xs mt-4" style={{color:C.muted+"50"}}>
+          Droits douane 5% inclus · Remplacement onduleurs An 15 · Comptage net Loi 04-09
+        </p>
+      </div>
+    </div>
+  );
+
+  // ── STEP 1: Location ───────────────────────────────────────────────────────
+  if(step===1){
+    const filtW=wilSearch?WILAYAS.filter(w=>w.name_fr.toLowerCase().includes(wilSearch.toLowerCase())
+      ||w.name_ar.includes(wilSearch)):WILAYAS;
+    return(
+      <div style={{backgroundColor:C.bg,minHeight:"100vh"}} className="p-5">
+        <WH s={1} t="Localisation & Institution" sub="Wilaya, type d'institution, surface de toiture"/>
+        <div className="max-w-3xl mx-auto space-y-5">
+          <Card title="Identification du Projet">
+            <TF label="Nom de l'institution" value={loc.institution_name} onChange={v=>setLoc({...loc,institution_name:v})}/>
+            <TF label="Adresse" value={loc.address} onChange={v=>setLoc({...loc,address:v})}/>
+            <SF2 label="Type d'institution" value={loc.institution_type} onChange={v=>setLoc({...loc,institution_type:v,DS:dsDefault(v)})}
+              opts={[{v:"university",l:"Université / École (DS=120 000 DA/an)"},{v:"hospital",l:"Hôpital / Clinique (DS=180 000 DA/an)"},{v:"admin",l:"Bâtiment administratif (DS=90 000 DA/an)"},{v:"other",l:"Autre"}]}/>
+          </Card>
+          <Card title="Wilaya — Données GHI (NASA POWER)">
+            <div>
+              <label className="block text-xs mb-1" style={{color:C.muted}}>Rechercher une wilaya</label>
+              <input type="text" placeholder="ex: Biskra, Alger, أدرار..." value={wilSearch} onChange={e=>setWilSearch(e.target.value)} className={iCls} style={iSt}/>
+            </div>
+            <div className="grid grid-cols-3 gap-1.5 max-h-56 overflow-y-auto pr-1" style={{scrollbarWidth:"thin"}}>
+              {filtW.map(w=>(
+                <button key={w.id} onClick={()=>setLoc({...loc,wilaya_id:w.id})}
+                  className="text-left p-2.5 rounded-xl border text-xs transition-all"
+                  style={{backgroundColor:loc.wilaya_id===w.id?C.gold+"22":C.navy,borderColor:loc.wilaya_id===w.id?C.gold:C.border,color:loc.wilaya_id===w.id?C.gold:C.muted}}>
+                  <span className="font-semibold block">{w.name_fr}</span>
+                  <span style={{color:loc.wilaya_id===w.id?C.goldL:C.muted+"60"}}>{w.ghi_annual} kWh/m²/j</span>
                 </button>
               ))}
             </div>
-            {selectedWilaya && (
-              <div
-                className="rounded-xl p-4 border"
-                style={{ backgroundColor: C.navy, borderColor: C.gold + "40" }}
-              >
-                <div className="flex justify-between items-start">
-                  <div>
-                    <div
-                      className="font-bold text-base"
-                      style={{ color: C.gold }}
-                    >
-                      {selectedWilaya.name}
-                    </div>
-                    <div className="text-xs mt-0.5" style={{ color: C.muted }}>
-                      GHI annuel:{" "}
-                      <span style={{ color: C.cream }}>
-                        {selectedWilaya.ghi_yr} kWh/m²/an
-                      </span>
-                      {" | "}GHI journalier:{" "}
-                      <span style={{ color: C.cream }}>
-                        {(selectedWilaya.ghi_yr / 365).toFixed(2)} kWh/m²/j
-                      </span>
-                    </div>
-                    <div className="text-xs" style={{ color: C.muted }}>
-                      Zone climatique:{" "}
-                      <span style={{ color: C.cream }}>
-                        Zone {ghiToZone(selectedWilaya.ghi_yr)}
-                      </span>
-                    </div>
-                  </div>
-                  <div className="text-right">
-                    <div
-                      className="text-xs font-semibold px-2 py-1 rounded-lg"
-                      style={{
-                        backgroundColor:
-                          selectedWilaya.ghi_yr > 2000
-                            ? C.gold + "20"
-                            : "#4a9eff20",
-                        color: selectedWilaya.ghi_yr > 2000 ? C.gold : C.blue,
-                      }}
-                    >
-                      {selectedWilaya.ghi_yr > 2000
-                        ? "Potentiel Eleve"
-                        : "Potentiel Modere"}
-                    </div>
+            <div className="rounded-xl p-4 border" style={{backgroundColor:C.navy,borderColor:C.gold+"40"}}>
+              <div className="flex justify-between items-center">
+                <div>
+                  <div className="font-bold text-sm" style={{color:C.gold}}>{selectedWilaya.name_fr} — {selectedWilaya.name_ar}</div>
+                  <div className="text-xs mt-0.5" style={{color:C.muted}}>
+                    GHI annuel: <span style={{color:C.cream}}>{selectedWilaya.ghi_annual} kWh/m²/j</span>
+                    {" | "}Latitude: <span style={{color:C.cream}}>{selectedWilaya.latitude}°N</span>
+                    {" | "}PR_soiling: <span style={{color:C.cream}}>{(selectedWilaya.pr_soiling_base*100).toFixed(1)}%</span>
                   </div>
                 </div>
+                <span className="text-xs px-2 py-1 rounded-lg font-semibold" style={{
+                  backgroundColor:selectedWilaya.ghi_annual>5.5?C.gold+"20":"#4a9eff20",
+                  color:selectedWilaya.ghi_annual>5.5?C.gold:C.blue}}>
+                  {selectedWilaya.ghi_annual>5.5?"Potentiel Élevé":"Potentiel Modéré"}
+                </span>
               </div>
-            )}
-          </Card>
-
-          <Card title="Surface de Toiture (Equation 1)">
-            <NF
-              label="Surface brute de toiture A_brute"
-              value={loc.gross_area}
-              onChange={(v) => updateLoc({ gross_area: v })}
-              unit="m²"
-              hint="Mesuree sur Google Earth ou plans architecturaux"
-            />
-            <div className="grid grid-cols-3 gap-3 mt-2">
-              {[
-                [
-                  "Eq.1 — Surface nette",
-                  "A_brute × 0.70",
-                  `${sizing.a_available.toFixed(2)} m²`,
-                  C.gold,
-                ],
-                [
-                  "Eq.2 — Nb. modules",
-                  "floor(A_nette / 1.94)",
-                  `${sizing.n_modules}`,
-                  C.green,
-                ],
-                [
-                  "Eq.3 — Puissance PV",
-                  "N × 370.3 / 1000",
-                  `${sizing.p_installed} kWp`,
-                  C.blue,
-                ],
-              ].map(([label, eq, val, color]) => (
-                <div
-                  key={label}
-                  className="rounded-xl p-3 border"
-                  style={{ backgroundColor: C.navy, borderColor: color + "30" }}
-                >
-                  <div
-                    className="text-xs font-bold mb-0.5"
-                    style={{ color: color as string }}
-                  >
-                    {label}
-                  </div>
-                  <div
-                    className="text-xs font-mono mb-1"
-                    style={{ color: C.muted + "80" }}
-                  >
-                    {eq}
-                  </div>
-                  <div
-                    className="text-lg font-black"
-                    style={{ color: color as string }}
-                  >
-                    {val}
-                  </div>
-                </div>
-              ))}
-            </div>
-            <div className="grid grid-cols-2 gap-3 mt-2">
-              {[
-                ["Onduleurs estimés (50kW/unit.)", `${sizing.n_inverters}`],
-                [
-                  "CAPEX auto-estimé (Eq.18)",
-                  `${Math.round(sizing.capex).toLocaleString()} DA`,
-                ],
-              ].map(([l, v]) => (
-                <div
-                  key={l}
-                  className="rounded-xl p-3 border"
-                  style={{ backgroundColor: C.navy, borderColor: C.border }}
-                >
-                  <div className="text-xs" style={{ color: C.muted }}>
-                    {l}
-                  </div>
-                  <div
-                    className="text-base font-bold mt-0.5"
-                    style={{ color: C.cream }}
-                  >
-                    {v}
-                  </div>
-                </div>
-              ))}
             </div>
           </Card>
-
-          <NavBtns
-            onBack={() => setStep(0)}
-            onNext={() => setStep(2)}
-            nextLabel="Suivant — Factures"
-            disabled={loc.gross_area < 10}
-          />
+          <Card title="Toiture & Configuration (Eq. 1-8)">
+            <div className="grid grid-cols-2 gap-3">
+              <NF label="Surface brute toiture (m²)" value={loc.gross_area} onChange={v=>setLoc({...loc,gross_area:v})} hint="Mesurée sur Google Earth / plans"/>
+              <NF label="Nombre de bâtiments" value={loc.n_buildings} onChange={v=>setLoc({...loc,n_buildings:v})}/>
+            </div>
+            <div className="grid grid-cols-3 gap-3">
+              <NF label="Inclinaison (°)" value={loc.tilt} onChange={v=>setLoc({...loc,tilt:v})} step={5} hint="30° optimal Algérie"/>
+              <SF2 label="Orientation" value={loc.orientation} onChange={v=>setLoc({...loc,orientation:v})}
+                opts={[{v:"Sud",l:"Sud (optimal)"},{v:"SSE",l:"SSE"},{v:"SSO",l:"SSO"}]}/>
+              <SF2 label="Fréquence nettoyage" value={loc.cleaning_freq} onChange={v=>setLoc({...loc,cleaning_freq:v})}
+                opts={[{v:"monthly",l:"Mensuel (PR_s=0.977)"},{v:"bimonthly",l:"Bi-mensuel (déf.)"},{v:"quarterly",l:"Trimestriel (0.963)"},{v:"annual",l:"Annuel (0.950)"}]}/>
+            </div>
+            {/* Auto-sizing preview */}
+            {loc.gross_area>=50&&(()=>{
+              const a_av=(loc.gross_area*0.7).toFixed(1);
+              const n_mod=Math.floor(loc.gross_area*0.7/2.77);
+              const n_str=Math.floor(n_mod/14);
+              const nm=n_str*14;
+              const kw=(nm*selectedPanel.power_wp/1000).toFixed(2);
+              return(
+                <div className="grid grid-cols-3 gap-2 mt-1">
+                  {[["Surface nette",`${a_av} m²`,C.gold],["Modules auto",`${nm}`,C.green],["kWp estimé",`${kw}`,C.blue]].map(([l,v,c])=>(
+                    <div key={l} className="rounded-xl p-3 border text-center" style={{backgroundColor:C.navy,borderColor:(c as string)+"30"}}>
+                      <div className="text-xs" style={{color:C.muted}}>{l}</div>
+                      <div className="font-black text-base" style={{color:c as string}}>{v}</div>
+                    </div>))}
+                </div>);
+            })()}
+          </Card>
+          <NB onBack={()=>setStep(0)} onNext={()=>setStep(2)} nextLabel="Suivant — Équipements" disabled={loc.gross_area<50}/>
         </div>
       </div>
     );
   }
 
-  // ── STEP 2: Factures ───────────────────────────────────────────────────────
-  if (step === 2)
-    return (
-      <div
-        style={{ backgroundColor: C.navy, minHeight: "100vh" }}
-        className="p-5"
-      >
-        <WH
-          s={2}
-          t="Factures Sonelgaz"
-          sub="Importez jusqu'à 12 factures — OCR auto + correction manuelle"
-        />
-        <div className="max-w-4xl mx-auto">
-          <div
-            className="rounded-xl p-3 mb-5 border text-xs"
-            style={{
-              backgroundColor: C.navy2,
-              borderColor: C.gold + "25",
-              color: C.muted,
-            }}
-          >
-            <span style={{ color: C.gold }} className="font-semibold">
-              Tarif HTA 42 :
-            </span>{" "}
-            L&apos;OCR extrait Cadran 1+2 (H.Hors Pointe) + Cadran 3 (H.Pointe)
-            + TOTAL FACTURE. Corrigez les valeurs dans le tableau ci-dessous si
-            l&apos;OCR est imprécis.
-          </div>
-
-          <div className="grid grid-cols-3 md:grid-cols-4 gap-3 mb-5">
-            {bills.map((bill, i) => (
-              <div key={i}>
-                <input
-                  ref={(el) => {
-                    fileRefs.current[i] = el;
-                  }}
-                  type="file"
-                  accept="image/*"
-                  className="hidden"
-                  onChange={(e) =>
-                    e.target.files?.[0] && processImage(e.target.files[0], i)
-                  }
-                />
-                <div
-                  onClick={() =>
-                    bill.status !== "processing" && fileRefs.current[i]?.click()
-                  }
-                  className="relative rounded-xl border-2 cursor-pointer overflow-hidden"
-                  style={{
-                    aspectRatio: "3/4",
-                    borderColor:
-                      bill.status === "empty"
-                        ? C.border
-                        : bill.status === "processing"
-                          ? C.gold
-                          : bill.ocrWarn
-                            ? "#f59e0b44"
-                            : "#22c55e44",
-                    backgroundColor: C.navy2,
-                  }}
-                >
-                  {bill.preview ? (
-                    <img
-                      src={bill.preview}
-                      className="w-full h-full object-cover"
-                      style={{ opacity: 0.6 }}
-                      alt=""
-                    />
-                  ) : (
-                    <div className="absolute inset-0 flex flex-col items-center justify-center gap-1">
-                      <div className="text-lg">📄</div>
-                      <div className="text-xs" style={{ color: C.gold + "80" }}>
-                        {M_SHORT[i]}
-                      </div>
-                    </div>
-                  )}
-                  {bill.status === "processing" && (
-                    <div
-                      className="absolute inset-0 flex items-center justify-center"
-                      style={{ backgroundColor: C.navy + "cc" }}
-                    >
-                      <div
-                        className="w-7 h-7 border-2 border-t-transparent rounded-full animate-spin"
-                        style={{ borderColor: C.gold }}
-                      />
-                    </div>
-                  )}
-                  {bill.status === "done" && (
-                    <div
-                      className="absolute top-1.5 right-1.5 w-5 h-5 rounded-full flex items-center justify-center text-xs font-bold"
-                      style={{
-                        backgroundColor: bill.ocrWarn ? "#f59e0b" : "#22c55e",
-                        color: C.navy,
-                      }}
-                    >
-                      {bill.ocrWarn ? "!" : "✓"}
-                    </div>
-                  )}
-                  <div
-                    className="absolute bottom-0 left-0 right-0 text-center py-0.5 text-xs font-semibold"
-                    style={{
-                      backgroundColor: C.navy + "cc",
-                      color: C.gold + "cc",
-                    }}
-                  >
-                    {M_SHORT[i]}
-                  </div>
+  // ── STEP 2: Equipment ─────────────────────────────────────────────────────
+  if(step===2) return(
+    <div style={{backgroundColor:C.bg,minHeight:"100vh"}} className="p-5">
+      <WH s={2} t="Sélection des Équipements" sub="Modules PV et onduleurs — prix DZD toutes taxes (5% douanes inclus)"/>
+      <div className="max-w-4xl mx-auto space-y-5">
+        <Card title="Modules Photovoltaïques — Sélectionnez votre modèle">
+          <div className="grid grid-cols-2 md:grid-cols-3 gap-3">
+            {PANEL_CATALOG.map(p=>(
+              <button key={p.id} onClick={()=>setEq({...eq,panel_id:p.id})}
+                className="text-left p-3 rounded-xl border transition-all"
+                style={{backgroundColor:eq.panel_id===p.id?C.gold+"18":C.navy,borderColor:eq.panel_id===p.id?C.gold:C.border}}>
+                <div className="font-bold text-xs" style={{color:eq.panel_id===p.id?C.gold:C.cream}}>{p.brand}</div>
+                <div className="text-xs font-semibold mt-0.5" style={{color:eq.panel_id===p.id?C.goldL:C.muted}}>{p.model}</div>
+                <div className="text-lg font-black mt-1" style={{color:eq.panel_id===p.id?C.gold:C.cream}}>{p.power_wp}W</div>
+                <div className="text-xs mt-1" style={{color:C.muted}}>
+                  <span className="px-1.5 py-0.5 rounded mr-1" style={{backgroundColor:C.navy3,color:eq.panel_id===p.id?C.goldL:C.muted}}>{p.technology}</span>
                 </div>
-                {bill.status === "empty" && (
-                  <button
-                    onClick={() => manualSlot(i)}
-                    className="w-full mt-1 text-xs py-1 rounded-lg"
-                    style={{
-                      backgroundColor: C.navy2,
-                      color: C.muted + "60",
-                      border: `1px solid ${C.border}`,
-                    }}
-                  >
-                    Saisie manuelle
-                  </button>
-                )}
-              </div>
+                <div className="text-xs mt-1.5" style={{color:C.muted}}>η={p.efficiency}% | γ={p.gamma}%/°C | {p.warranty_yrs}ans</div>
+                <div className="font-bold text-sm mt-2" style={{color:eq.panel_id===p.id?C.gold:C.cream}}>
+                  {p.price_dz.toLocaleString()} DA
+                  <span className="text-xs font-normal ml-1" style={{color:C.muted}}>/unité</span>
+                </div>
+                <div className="text-xs" style={{color:C.muted+"70"}}>Douanes 5% inclus</div>
+              </button>
             ))}
           </div>
+        </Card>
+        <Card title="Onduleurs — Sélectionnez votre modèle">
+          <div className="grid grid-cols-2 md:grid-cols-3 gap-3">
+            {INVERTER_CATALOG.map(inv=>(
+              <button key={inv.id} onClick={()=>setEq({...eq,inverter_id:inv.id})}
+                className="text-left p-3 rounded-xl border transition-all"
+                style={{backgroundColor:eq.inverter_id===inv.id?C.blue+"20":C.navy,borderColor:eq.inverter_id===inv.id?C.blue:C.border}}>
+                <div className="font-bold text-xs" style={{color:eq.inverter_id===inv.id?C.blue:C.cream}}>{inv.brand}</div>
+                <div className="text-xs font-semibold mt-0.5" style={{color:C.muted}}>{inv.model}</div>
+                <div className="text-lg font-black mt-1" style={{color:eq.inverter_id===inv.id?C.blue:C.cream}}>{inv.power_kw} kW</div>
+                <div className="text-xs mt-1" style={{color:C.muted}}>η={inv.efficiency}% | {inv.warranty_yrs}ans garantie</div>
+                <div className="text-xs" style={{color:C.muted}}>Vdc max {inv.max_dc_v}V | MPPT {inv.mppt_min_v}–{inv.mppt_max_v}V</div>
+                <div className="font-bold text-sm mt-2" style={{color:eq.inverter_id===inv.id?C.blue:C.cream}}>
+                  {inv.price_dz.toLocaleString()} DA<span className="text-xs font-normal ml-1" style={{color:C.muted}}>/unité</span>
+                </div>
+                <div className="text-xs" style={{color:C.muted+"70"}}>Douanes 5% inclus</div>
+              </button>
+            ))}
+          </div>
+        </Card>
+        <div className="rounded-xl p-4 border" style={{backgroundColor:C.navy2,borderColor:C.gold+"30"}}>
+          <div className="text-xs font-bold" style={{color:C.gold}}>Équipement sélectionné</div>
+          <div className="flex justify-between mt-2 text-xs" style={{color:C.muted}}>
+            <span>Module: <span style={{color:C.cream}}>{selectedPanel.brand} {selectedPanel.model} — {selectedPanel.power_wp}Wp — {selectedPanel.price_dz.toLocaleString()} DA</span></span>
+            <span>Onduleur: <span style={{color:C.cream}}>{selectedInv.brand} {selectedInv.model} — {selectedInv.power_kw}kW — {selectedInv.price_dz.toLocaleString()} DA</span></span>
+          </div>
+        </div>
+        <NB onBack={()=>setStep(1)} onNext={()=>setStep(3)} nextLabel="Suivant — Factures"/>
+      </div>
+    </div>
+  );
 
-          {doneBills > 0 && (
-            <div
-              className="rounded-xl border overflow-hidden mb-5"
-              style={{ borderColor: C.border }}
-            >
-              <div
-                className="px-4 py-3 font-bold text-sm border-b flex items-center justify-between"
-                style={{
-                  backgroundColor: C.navy2,
-                  color: C.gold,
-                  borderColor: C.border,
-                }}
-              >
-                <span>Vérification & Correction des valeurs OCR</span>
-                <span
-                  className="text-xs font-normal"
-                  style={{ color: C.muted }}
-                >
-                  {doneBills}/12 factures
-                </span>
+  // ── STEP 3: Invoices ──────────────────────────────────────────────────────
+  if(step===3) return(
+    <div style={{backgroundColor:C.bg,minHeight:"100vh"}} className="p-5">
+      <WH s={3} t="Factures Sonelgaz" sub="Importez 12 à 36 factures — OCR Claude Vision (Arabe+Français)"/>
+      <div className="max-w-5xl mx-auto">
+        <div className="rounded-xl p-3 mb-5 border text-xs" style={{backgroundColor:C.navy2,borderColor:C.gold+"25",color:C.muted}}>
+          <span style={{color:C.gold}} className="font-semibold">HTA Tarif 42 :</span>{" "}
+          L&apos;OCR Claude Vision extrait Cadran 1+2 (H.Hors Pointe) + Cadran 3 (H.Pointe) + Net à Payer.
+          Corrigez dans le tableau ci-dessous. Minimum 12 factures recommandé — 24-36 pour moyenne fiable.
+        </div>
+        <div className="grid grid-cols-4 md:grid-cols-6 gap-2 mb-5">
+          {invoices.slice(0,24).map((slot,i)=>(
+            <div key={i}>
+              <input ref={el=>{fileRefs.current[i]=el;}} type="file" accept="image/*,application/pdf" className="hidden"
+                onChange={e=>e.target.files?.[0]&&processImage(e.target.files[0],i)}/>
+              <div onClick={()=>slot.status!=="processing"&&fileRefs.current[i]?.click()}
+                className="relative rounded-xl border cursor-pointer overflow-hidden"
+                style={{aspectRatio:"3/4",borderColor:slot.status==="empty"?C.border:slot.status==="processing"?C.gold:slot.status==="error"?"#ef444433":"#22c55e33",backgroundColor:C.navy2}}>
+                {slot.preview?<img src={slot.preview} className="w-full h-full object-cover" style={{opacity:0.6}} alt=""/>
+                :<div className="absolute inset-0 flex flex-col items-center justify-center">
+                  <div className="text-sm mb-0.5">📄</div>
+                  <div className="text-xs" style={{color:C.gold+"70"}}>{i+1}</div>
+                </div>}
+                {slot.status==="processing"&&<div className="absolute inset-0 flex items-center justify-center" style={{backgroundColor:C.navy+"cc"}}>
+                  <div className="w-5 h-5 border-2 border-t-transparent rounded-full animate-spin" style={{borderColor:C.gold}}/></div>}
+                {(slot.status==="done"||slot.status==="error")&&<div className="absolute top-1 right-1 w-4 h-4 rounded-full flex items-center justify-center text-xs font-bold"
+                  style={{backgroundColor:slot.warn?"#f59e0b":slot.status==="error"?"#ef4444":"#22c55e",color:C.navy}}>
+                  {slot.warn||slot.status==="error"?"!":"✓"}</div>}
               </div>
-              <div className="overflow-x-auto">
-                <table className="w-full text-xs">
-                  <thead>
-                    <tr style={{ backgroundColor: C.navy2 }}>
-                      {[
-                        "Mois",
-                        "Image",
-                        "HHP kWh (Cad.1+2)",
-                        "HP Pointe kWh (Cad.3)",
-                        "Total DA",
-                        "Mois (1-12)",
-                        "Année",
-                      ].map((h) => (
-                        <th
-                          key={h}
-                          className="py-2 px-2 text-left font-semibold"
-                          style={{ color: C.muted }}
-                        >
-                          {h}
-                        </th>
-                      ))}
-                    </tr>
-                  </thead>
-                  <tbody>
-                    {bills.map((b, i) =>
-                      b.status === "done" && b.edited ? (
-                        <tr
-                          key={i}
-                          className="border-t"
-                          style={{ borderColor: C.border + "40" }}
-                        >
-                          <td
-                            className="py-1.5 px-2"
-                            style={{ color: C.gold + "aa" }}
-                          >
-                            <div className="font-semibold">{M_SHORT[i]}</div>
-                            {b.ocrWarn && (
-                              <div
-                                className="text-xs"
-                                style={{ color: "#f59e0b" }}
-                              >
-                                {b.ocrWarn}
-                              </div>
-                            )}
-                          </td>
-                          <td className="py-1 px-2">
-                            {b.preview && (
-                              <img
-                                src={b.preview}
-                                className="w-10 h-14 object-cover rounded-md"
-                                alt=""
-                              />
-                            )}
-                          </td>
-                          {(["hp_kwh", "peak_kwh", "total_da"] as const).map(
-                            (field) => (
-                              <td key={field} className="py-1 px-1.5">
-                                <input
-                                  type="number"
-                                  value={b.edited![field] || ""}
-                                  onChange={(e) =>
-                                    updField(
-                                      i,
-                                      field,
-                                      parseFloat(e.target.value) || 0,
-                                    )
-                                  }
-                                  className="w-full text-right px-2 py-1.5 rounded-lg text-xs outline-none"
-                                  style={{
-                                    backgroundColor: C.navy,
-                                    border: `1px solid ${b.ocrWarn && b.edited![field] === 0 ? "#f59e0b44" : C.border}`,
-                                    color: C.light,
-                                  }}
-                                />
-                              </td>
-                            ),
-                          )}
-                          <td className="py-1 px-1.5">
-                            <input
-                              type="number"
-                              min={1}
-                              max={12}
-                              value={b.edited!.month || ""}
-                              onChange={(e) =>
-                                updField(
-                                  i,
-                                  "month",
-                                  parseInt(e.target.value) || 0,
-                                )
-                              }
-                              className="w-16 text-center px-2 py-1.5 rounded-lg text-xs outline-none"
-                              style={{
-                                backgroundColor: C.navy,
-                                border: `1px solid ${C.border}`,
-                                color: C.light,
-                              }}
-                            />
-                          </td>
-                          <td className="py-1 px-1.5">
-                            <input
-                              type="number"
-                              min={2020}
-                              max={2030}
-                              value={b.edited!.year || ""}
-                              onChange={(e) =>
-                                updField(
-                                  i,
-                                  "year",
-                                  parseInt(e.target.value) || 0,
-                                )
-                              }
-                              className="w-20 text-center px-2 py-1.5 rounded-lg text-xs outline-none"
-                              style={{
-                                backgroundColor: C.navy,
-                                border: `1px solid ${C.border}`,
-                                color: C.light,
-                              }}
-                            />
-                          </td>
-                        </tr>
-                      ) : null,
-                    )}
-                  </tbody>
-                </table>
+              {slot.status==="empty"&&<button onClick={()=>manualSlot(i)} className="w-full mt-1 text-xs py-0.5 rounded-lg"
+                style={{backgroundColor:C.navy2,color:C.muted+"50",border:`1px solid ${C.border}`}}>Manuel</button>}
+            </div>
+          ))}
+        </div>
+        {doneBills>0&&(
+          <div className="rounded-xl border overflow-hidden mb-5" style={{borderColor:C.border}}>
+            <div className="px-4 py-3 font-bold text-sm flex justify-between" style={{backgroundColor:C.navy2,color:C.gold}}>
+              <span>Vérification & Correction — Données OCR</span>
+              <span className="text-xs font-normal" style={{color:C.muted}}>{doneBills} factures</span>
+            </div>
+            <div className="overflow-x-auto">
+              <table className="w-full text-xs">
+                <thead><tr style={{backgroundColor:C.navy2}}>
+                  {["#","Img","Période (AAAA-MM)","HHP kWh (Cad.1+2)","HP Pointe kWh (Cad.3)","Total kWh","Montant DA","Tarif eff."].map(h=>(
+                    <th key={h} className="py-2 px-2 text-left font-semibold" style={{color:C.muted}}>{h}</th>))}
+                </tr></thead>
+                <tbody>
+                  {invoices.map((s,i)=>s.status==="done"&&s.edited?(
+                    <tr key={i} className="border-t" style={{borderColor:C.border+"40"}}>
+                      <td className="py-1 px-2 font-semibold" style={{color:C.gold+"aa"}}>{i+1}{s.warn&&<div className="text-xs" style={{color:"#f59e0b"}}>{s.warn}</div>}</td>
+                      <td className="py-1 px-2">{s.preview&&<img src={s.preview} className="w-8 h-11 object-cover rounded" alt=""/>}</td>
+                      <td className="py-1 px-1.5"><input type="text" value={s.edited.billing_period||""} onChange={e=>updInv(i,"billing_period",e.target.value)}
+                        placeholder="2024-01" className="w-24 text-center px-2 py-1.5 rounded-lg text-xs outline-none" style={{backgroundColor:C.navy,border:`1px solid ${C.border}`,color:C.light}}/></td>
+                      {(["h_pointe_kwh","peak_kwh","total_kwh","invoice_da"] as const).map(f=>(
+                        <td key={f} className="py-1 px-1"><input type="number" value={s.edited![f]||""}
+                          onChange={e=>updInv(i,f,parseFloat(e.target.value)||0)}
+                          className="w-full text-right px-2 py-1.5 rounded-lg text-xs outline-none"
+                          style={{backgroundColor:C.navy,border:`1px solid ${s.warn&&!s.edited![f]?"#f59e0b44":C.border}`,color:C.light}}/></td>))}
+                      <td className="py-1 px-2 text-right" style={{color:s.edited.eff_tariff<4||s.edited.eff_tariff>6.5?"#f59e0b":C.green}}>
+                        {s.edited.eff_tariff?.toFixed(3)||"—"}</td>
+                    </tr>):null)}
+                </tbody>
+              </table>
+            </div>
+            <div className="px-4 py-2 text-xs" style={{backgroundColor:C.navy2,color:C.muted+"50"}}>
+              Tarif eff. attendu HTA 42: 4.50–5.60 DA/kWh | Mois manquants → moyenne des mois disponibles
+            </div>
+          </div>
+        )}
+        <div className="flex gap-3">
+          <button onClick={()=>setStep(2)} className="flex-1 py-3 rounded-xl text-sm" style={{border:`1px solid ${C.border}`,color:C.muted}}>Retour</button>
+          <button onClick={()=>setStep(4)} disabled={doneBills<1} className="flex-grow py-3 rounded-xl font-bold disabled:opacity-30" style={{backgroundColor:C.gold,color:C.navy}}>
+            Suivant — Système ({doneBills} factures)
+          </button>
+        </div>
+      </div>
+    </div>
+  );
+
+  // ── STEP 4: System review ─────────────────────────────────────────────────
+  if(step===4) return(
+    <div style={{backgroundColor:C.bg,minHeight:"100vh"}} className="p-5">
+      <WH s={4} t="Paramètres Système" sub="Valeurs auto-calculées — toutes éditables"/>
+      <div className="max-w-2xl mx-auto space-y-5">
+        {/* Show auto-sizing */}
+        {(()=>{
+          const a_av=+(loc.gross_area*0.7).toFixed(2);
+          const n_max=Math.floor(a_av/2.77);
+          const n_str=Math.floor(n_max/14);
+          const nm=n_str*14;
+          const kw=+(nm*selectedPanel.power_wp/1000).toFixed(2);
+          const ni=Math.max(1,Math.ceil(kw/selectedInv.power_kw));
+          const dc_ac=+(kw/(ni*selectedInv.power_kw)).toFixed(3);
+          return(
+            <div className="rounded-xl p-4 border" style={{backgroundColor:C.navy2,borderColor:C.gold+"30"}}>
+              <div className="text-xs font-bold uppercase tracking-widest mb-3" style={{color:C.gold}}>Dimensionnement Auto (Éq. 1-8)</div>
+              <div className="grid grid-cols-4 gap-3 text-center">
+                {[[`${a_av} m²`,"Surface nette"],[`${nm}`,"Modules"],[`${kw} kWp`,"P installée"],[`${ni}`,"Onduleurs"]].map(([v,l])=>(
+                  <div key={l}><div className="text-sm font-black" style={{color:C.cream}}>{v}</div><div className="text-xs" style={{color:C.muted}}>{l}</div></div>
+                ))}
               </div>
-              <div
-                className="px-4 py-2 text-xs"
-                style={{ backgroundColor: C.navy2, color: C.muted + "50" }}
-              >
-                Les mois sans facture utiliseront la consommation moyenne des
-                mois renseignés.
+              <div className="mt-2 text-xs text-center" style={{color:dc_ac>=1.05&&dc_ac<=1.30?C.green:C.orange}}>
+                Ratio DC/AC: {dc_ac} {dc_ac>=1.05&&dc_ac<=1.30?"✓ [1.05–1.30]":"⚠ Hors plage"}
               </div>
+            </div>
+          );
+        })()}
+        <Card title="Performance Ratio">
+          <NF label="Performance Ratio PR (%)" value={80} onChange={()=>{}} step={1} hint="80% par défaut — ajusté mensuellement par la température"/>
+          <div className="text-xs" style={{color:C.muted}}>
+            Éq. 11 — PR_soiling={`${(selectedWilaya.pr_soiling_base*100).toFixed(1)}%`} (nettoyage {loc.cleaning_freq})
+          </div>
+        </Card>
+        <NB onBack={()=>setStep(3)} onNext={()=>setStep(5)} nextLabel="Suivant — Paramètres Financiers"/>
+      </div>
+    </div>
+  );
+
+  // ── STEP 5: Financial ─────────────────────────────────────────────────────
+  if(step===5) return(
+    <div style={{backgroundColor:C.bg,minHeight:"100vh"}} className="p-5">
+      <WH s={5} t="Paramètres Financiers" sub="Modèle DCF 25 ans — 3 scénarios"/>
+      <div className="max-w-2xl mx-auto space-y-5">
+        <Card title="Taux de Référence">
+          <NF label="Taux d'actualisation r (%)" value={fin.r} onChange={v=>setFin({...fin,r:v})} step={0.5} hint="6% — taux institutionnel algérien de référence"/>
+          <NF label="Inflation tarifaire f (%/an)" value={fin.f} onChange={v=>setFin({...fin,f:v})} step={0.5} hint="4%/an — CAGR observé Sonelgaz 2023-2025 (marge sécurité)"/>
+          <NF label="O&M (% CAPEX/an)" value={fin.om_rate} onChange={v=>setFin({...fin,om_rate:v})} step={0.1} hint="1% standard (maintenance + assurance + nettoyage)"/>
+        </Card>
+        <Card title="Économies Demande (DS — TOUJOURS FIXE)" accent={C.green}>
+          <NF label="DS (DA/an) — ne pas indexer à f" value={fin.DS} onChange={v=>setFin({...fin,DS:v})} step={5000}
+            hint={`Défaut ${fin.DS.toLocaleString()} DA/an (type: ${loc.institution_type})`}/>
+          <div className="rounded-xl p-3 border text-xs" style={{backgroundColor:C.navy,borderColor:C.gold+"30",color:C.muted}}>
+            ⚠ DS est une constante sur 25 ans. L&apos;indexer à f est une erreur méthodologique grave.
+          </div>
+        </Card>
+        <Card title="Scénarios Financiers" accent={C.blue}>
+          <NF label="Taux subvention Sc2 (%) — PREREC/APRUE" value={fin.subsidy_rate} onChange={v=>setFin({...fin,subsidy_rate:v})} step={5} hint="20% standard programme PREREC"/>
+          <NF label="Taux crédit bancaire Sc3 (%)" value={fin.loan_rate} onChange={v=>setFin({...fin,loan_rate:v})} step={0.5} hint="6.5% — banques algériennes 2025"/>
+          <NF label="Durée crédit Sc3 (ans)" value={fin.loan_years} onChange={v=>setFin({...fin,loan_years:v})} step={1} hint="15 ans recommandé"/>
+          <NF label="Apport Sc3 (% du CAPEX)" value={fin.loan_down} onChange={v=>setFin({...fin,loan_down:v})} step={5} hint="20% minimum"/>
+        </Card>
+        <div className="flex gap-3">
+          <button onClick={()=>setStep(4)} className="flex-1 py-3 rounded-xl text-sm" style={{border:`1px solid ${C.border}`,color:C.muted}}>Retour</button>
+          <button onClick={compute} disabled={computing} className="flex-grow py-3 rounded-xl font-bold disabled:opacity-40" style={{backgroundColor:C.gold,color:C.navy}}>
+            {computing?<span className="flex items-center justify-center gap-2">
+              <span className="w-4 h-4 border-2 border-t-transparent rounded-full animate-spin" style={{borderColor:C.navy}}/>
+              Calcul des 55 équations...
+            </span>:"Lancer l'étude complète →"}
+          </button>
+        </div>
+      </div>
+    </div>
+  );
+
+  // ── STEP 6: Results ───────────────────────────────────────────────────────
+  if(step===6&&results){
+    const r=results;
+    return(
+      <div style={{backgroundColor:C.bg,minHeight:"100vh"}} className="p-5">
+        <div className="max-w-5xl mx-auto">
+          {/* Header */}
+          <div className="flex items-start justify-between mb-5 gap-4">
+            <div>
+              <div className="text-xs tracking-widest mb-1" style={{color:C.gold+"80"}}>RÉSULTATS — 55 ÉQUATIONS IEC 61724</div>
+              <h1 className="text-2xl font-bold" style={{color:C.light}}>{loc.institution_name}</h1>
+              <p className="text-sm mt-1" style={{color:C.muted}}>
+                {selectedWilaya.name_fr} · {r.sizing.p_installed} kWp · {r.sizing.n_modules} modules {selectedPanel.brand} · T₀={r.t0} DA/kWh
+              </p>
+            </div>
+            <button onClick={dlPDF} disabled={genPdf} className="shrink-0 px-5 py-3 rounded-xl font-bold transition-opacity hover:opacity-90 disabled:opacity-40 text-sm" style={{backgroundColor:C.gold,color:C.navy}}>
+              {genPdf?"Génération...":"📄 PDF (12 pages)"}
+            </button>
+          </div>
+
+          {/* Warnings */}
+          {r.warnings.length>0&&(
+            <div className="rounded-xl p-3 mb-4 border" style={{backgroundColor:"#7c2d1220",borderColor:"#f97316"}}>
+              <div className="font-bold text-xs mb-1" style={{color:C.orange}}>⚠ Avertissements ({r.warnings.length})</div>
+              {r.warnings.map((w,i)=><div key={i} className="text-xs" style={{color:C.cream}}>{w}</div>)}
             </div>
           )}
 
-          <div className="flex gap-3">
-            <button
-              onClick={() => setStep(1)}
-              className="flex-1 py-3 rounded-xl text-sm"
-              style={{ border: `1px solid ${C.border}`, color: C.muted }}
-            >
-              Retour
-            </button>
-            <button
-              onClick={() => setStep(3)}
-              disabled={doneBills < 1}
-              className="flex-grow py-3 rounded-xl font-bold transition-opacity hover:opacity-90 disabled:opacity-30"
-              style={{ backgroundColor: C.gold, color: C.navy }}
-            >
-              Suivant — Système ({doneBills}/12 factures)
-            </button>
-          </div>
-        </div>
-      </div>
-    );
-
-  // ── STEP 3: Système ────────────────────────────────────────────────────────
-  if (step === 3)
-    return (
-      <div
-        style={{ backgroundColor: C.navy, minHeight: "100vh" }}
-        className="p-5"
-      >
-        <WH
-          s={3}
-          t="Paramètres du Système PV"
-          sub="Valeurs auto-calculées depuis l'Étape 1 — toutes éditables"
-        />
-        <div className="max-w-2xl mx-auto space-y-5">
-          <Card title="Modules & Onduleurs">
-            <NF
-              label="Puissance installée (kWp)"
-              value={sys.p_installed}
-              onChange={(v) => setSys({ ...sys, p_installed: v })}
-              step={0.01}
-            />
-            <NF
-              label="Nombre de modules"
-              value={sys.n_modules}
-              onChange={(v) => setSys({ ...sys, n_modules: v })}
-            />
-            <TF
-              label="Marque module"
-              value={sys.module_brand}
-              onChange={(v) => setSys({ ...sys, module_brand: v })}
-            />
-            <TF
-              label="Modèle module"
-              value={sys.module_model}
-              onChange={(v) => setSys({ ...sys, module_model: v })}
-            />
-            <NF
-              label="Puissance module (Wp)"
-              value={sys.module_power}
-              onChange={(v) => setSys({ ...sys, module_power: v })}
-            />
-            <TF
-              label="Onduleurs"
-              value={sys.inverter_brand}
-              onChange={(v) => setSys({ ...sys, inverter_brand: v })}
-            />
-            <NF
-              label="Nombre d'onduleurs"
-              value={sys.n_inverters}
-              onChange={(v) => setSys({ ...sys, n_inverters: v })}
-            />
-          </Card>
-          <Card title="Site & Performance" accent={C.blue}>
-            <NF
-              label="Performance Ratio PR (%)"
-              value={sys.pr}
-              onChange={(v) => setSys({ ...sys, pr: v })}
-              step={1}
-              hint="75-85% typique — 80% par défaut (IEC 61724)"
-            />
-            <NF
-              label="Inclinaison (degrés)"
-              value={sys.tilt}
-              onChange={(v) => setSys({ ...sys, tilt: v })}
-            />
-            <TF
-              label="Orientation"
-              value={sys.orientation}
-              onChange={(v) => setSys({ ...sys, orientation: v })}
-            />
-          </Card>
-          <Card title="CAPEX Détaillé — Equation 18" accent={C.green}>
-            <p className="text-xs mb-2" style={{ color: C.muted }}>
-              5% de contingence appliqué automatiquement sur le sous-total.
-            </p>
-            <NF
-              label="Modules PV (DA)"
-              value={sys.c_modules}
-              onChange={(v) => setSys({ ...sys, c_modules: v })}
-              step={10000}
-              unit="DA"
-            />
-            <NF
-              label="Onduleurs (DA)"
-              value={sys.c_inverters}
-              onChange={(v) => setSys({ ...sys, c_inverters: v })}
-              step={100000}
-              unit="DA"
-            />
-            <NF
-              label="Structures aluminium (DA)"
-              value={sys.c_structure}
-              onChange={(v) => setSys({ ...sys, c_structure: v })}
-              step={10000}
-              unit="DA"
-            />
-            <NF
-              label="Câblage & protection (DA)"
-              value={sys.c_cabling}
-              onChange={(v) => setSys({ ...sys, c_cabling: v })}
-              step={50000}
-              unit="DA"
-            />
-            <NF
-              label="Raccordement HTA (DA)"
-              value={sys.c_transform}
-              onChange={(v) => setSys({ ...sys, c_transform: v })}
-              step={50000}
-              unit="DA"
-            />
-            <NF
-              label="Main d'œuvre & pose (DA)"
-              value={sys.c_labor}
-              onChange={(v) => setSys({ ...sys, c_labor: v })}
-              step={10000}
-              unit="DA"
-            />
-            <NF
-              label="Études & permis (DA)"
-              value={sys.c_eng}
-              onChange={(v) => setSys({ ...sys, c_eng: v })}
-              step={10000}
-              unit="DA"
-            />
-            <div
-              className="rounded-xl p-3 border mt-3"
-              style={{ backgroundColor: C.navy, borderColor: C.green + "40" }}
-            >
-              <div className="flex justify-between">
-                <span className="text-xs font-bold" style={{ color: C.green }}>
-                  CAPEX TOTAL (+ 5% contingences)
-                </span>
-                <span className="text-sm font-black" style={{ color: C.cream }}>
-                  {Math.round(
-                    (sys.c_modules +
-                      sys.c_inverters +
-                      sys.c_structure +
-                      sys.c_cabling +
-                      sys.c_transform +
-                      sys.c_labor +
-                      sys.c_eng) *
-                      1.05,
-                  ).toLocaleString()}{" "}
-                  DA
-                </span>
-              </div>
-            </div>
-          </Card>
-          <NavBtns
-            onBack={() => setStep(2)}
-            onNext={() => setStep(4)}
-            nextLabel="Suivant — Financier"
-          />
-        </div>
-      </div>
-    );
-
-  // ── STEP 4: Financier ──────────────────────────────────────────────────────
-  if (step === 4)
-    return (
-      <div
-        style={{ backgroundColor: C.navy, minHeight: "100vh" }}
-        className="p-5"
-      >
-        <WH
-          s={4}
-          t="Paramètres Financiers"
-          sub="Hypothèses du modèle DCF 25 ans"
-        />
-        <div className="max-w-2xl mx-auto space-y-5">
-          <Card title="Taux & Dégradation">
-            <NF
-              label="Taux d'actualisation r (%)"
-              value={fin.r}
-              onChange={(v) => setFin({ ...fin, r: v })}
-              step={0.5}
-              hint="6% — taux institutionnel algérien de référence"
-            />
-            <NF
-              label="Inflation tarifaire f (%/an)"
-              value={fin.f}
-              onChange={(v) => setFin({ ...fin, f: v })}
-              step={0.5}
-              hint="4%/an — CAGR observé Sonelgaz 2023-2025"
-            />
-            <NF
-              label="Dégradation modules D (%/an)"
-              value={fin.D}
-              onChange={(v) => setFin({ ...fin, D: v })}
-              step={0.1}
-              hint="0.5%/an — garantie Jinko JKM 25 ans"
-            />
-          </Card>
-          <Card title="Coûts & Économies" accent={C.green}>
-            <NF
-              label="O&M (% CAPEX/an) — Eq.19"
-              value={fin.om_rate}
-              onChange={(v) => setFin({ ...fin, om_rate: v })}
-              step={0.1}
-              hint="1% standard — maintenance + assurance"
-            />
-            <NF
-              label="Économies demande DS (DA/an) — FIXE"
-              value={fin.DS}
-              onChange={(v) => setFin({ ...fin, DS: v })}
-              step={1000}
-              hint="Réduction facture demande/réactif — NE PAS indexer"
-            />
-            <NF
-              label="Subvention Scénario 2 (%)"
-              value={fin.subsidy_rate}
-              onChange={(v) => setFin({ ...fin, subsidy_rate: v })}
-              step={5}
-              hint="APRUE/PREREC — 20% standard"
-            />
-          </Card>
-          <div
-            className="rounded-xl p-4 border text-sm"
-            style={{
-              border: `1px solid ${C.gold}33`,
-              backgroundColor: C.gold + "08",
-              color: C.muted,
-            }}
-          >
-            <div className="font-bold mb-1" style={{ color: C.gold }}>
-              ⚠ DS est une constante — jamais indexée à f
-            </div>
-            DS = {fin.DS.toLocaleString()} DA/an dans toutes les années 1-25.
-            Indexer DS serait une erreur méthodologique grave (suréstime le
-            VAN).
-          </div>
-          <div className="flex gap-3">
-            <button
-              onClick={() => setStep(3)}
-              className="flex-1 py-3 rounded-xl text-sm"
-              style={{ border: `1px solid ${C.border}`, color: C.muted }}
-            >
-              Retour
-            </button>
-            <button
-              onClick={compute}
-              disabled={computing}
-              className="flex-grow py-3 rounded-xl font-bold transition-opacity hover:opacity-90 disabled:opacity-40"
-              style={{ backgroundColor: C.gold, color: C.navy }}
-            >
-              {computing ? (
-                <span className="flex items-center justify-center gap-2">
-                  <span
-                    className="w-4 h-4 border-2 border-t-transparent rounded-full animate-spin"
-                    style={{ borderColor: C.navy }}
-                  />
-                  Calcul des 35 équations...
-                </span>
-              ) : (
-                "Lancer l'étude complète"
-              )}
-            </button>
-          </div>
-        </div>
-      </div>
-    );
-
-  // ── STEP 5: Résultats ──────────────────────────────────────────────────────
-  if (step === 5 && results) {
-    const r = results;
-    const wilaya = WILAYAS.find((w) => w.id === loc.wilaya_id) ?? WILAYAS[6];
-    const capex = r.capex;
-    return (
-      <div
-        style={{ backgroundColor: C.navy, minHeight: "100vh" }}
-        className="p-5"
-      >
-        <div className="max-w-5xl mx-auto">
-          {/* Header */}
-          <div className="flex items-start justify-between mb-6 gap-4">
-            <div>
-              <div
-                className="text-xs tracking-widest mb-1"
-                style={{ color: C.gold + "80" }}
-              >
-                RÉSULTATS — 35 ÉQUATIONS
-              </div>
-              <h1 className="text-2xl font-bold" style={{ color: C.light }}>
-                {loc.building_name}
-              </h1>
-              <p className="text-sm mt-1" style={{ color: C.muted }}>
-                {wilaya.name} · {sys.p_installed} kWp · {sys.n_modules} modules
-                · GHI {wilaya.ghi_yr} kWh/m²/an · T₀ = {r.t0} DA/kWh
-              </p>
-            </div>
-            <button
-              onClick={downloadPDF}
-              disabled={genPdf}
-              className="shrink-0 px-6 py-3 rounded-xl font-bold transition-opacity hover:opacity-90 disabled:opacity-40 text-sm"
-              style={{ backgroundColor: C.gold, color: C.navy }}
-            >
-              {genPdf ? "Génération..." : "Télécharger PDF (9 pages)"}
-            </button>
-          </div>
-
           {/* KPI grid */}
-          <div className="grid grid-cols-2 md:grid-cols-4 gap-3 mb-5">
+          <div className="grid grid-cols-2 md:grid-cols-4 gap-3 mb-4">
             {[
-              {
-                l: "VAN Sc1 (Eq.27)",
-                v: `${(r.npv_sc1 / 1e6).toFixed(2)} M DA`,
-                ok: r.npv_sc1 > 0,
-                c: C.gold,
-              },
-              {
-                l: "TRI Sc1 (Eq.28)",
-                v: `${r.irr_sc1}%`,
-                ok: r.irr_sc1 > fin.r,
-                c: C.green,
-              },
-              {
-                l: "DRS Sc1 (Eq.23)",
-                v: `${r.spp_sc1} ans`,
-                ok: true,
-                c: C.cream,
-              },
-              { l: "LCOE (Eq.30)", v: `${r.lcoe} DA/kWh`, ok: true, c: C.blue },
-              { l: "SCR Annuel (Eq.14)", v: `${r.scr}%`, ok: true, c: C.gold },
-              {
-                l: "E_annual (Eq.4)",
-                v: `${(r.e_annual / 1000).toFixed(0)} MWh`,
-                ok: true,
-                c: C.cream,
-              },
-              {
-                l: "VAN Sc2 (Eq.27)",
-                v: `${(r.npv_sc2 / 1e6).toFixed(2)} M DA`,
-                ok: r.npv_sc2 > 0,
-                c: C.blue,
-              },
-              {
-                l: "CO2 evité (Eq.33)",
-                v: `${r.co2_yr1} t/an`,
-                ok: true,
-                c: C.green,
-              },
-            ].map((k) => (
-              <div
-                key={k.l}
-                className="rounded-xl p-4 border"
-                style={{ backgroundColor: C.navy2, borderColor: k.c + "22" }}
-              >
-                <div className="text-xs mb-1" style={{ color: C.muted }}>
-                  {k.l}
-                </div>
-                <div
-                  className="text-lg font-black"
-                  style={{ color: k.ok ? k.c : C.red }}
-                >
-                  {k.v}
-                </div>
+              {l:"VAN Sc1",v:`${(r.npv_sc1/1e6).toFixed(2)} M DA`,ok:r.npv_sc1>0,c:C.gold},
+              {l:"TRI Sc1",v:`${r.irr_sc1}%`,ok:r.irr_sc1>fin.r,c:C.green},
+              {l:"DRS Sc1",v:`${r.spp_sc1} ans`,ok:true,c:C.cream},
+              {l:"LCOE",v:`${r.lcoe} DA/kWh`,ok:true,c:C.blue},
+              {l:"SCR (Éq.28)",v:`${r.scr_annual}%`,ok:true,c:C.gold},
+              {l:"E_annual",v:`${(r.e_annual/1000).toFixed(0)} MWh`,ok:true,c:C.cream},
+              {l:"VAN Sc2",v:`${(r.npv_sc2/1e6).toFixed(2)} M DA`,ok:r.npv_sc2>0,c:C.blue},
+              {l:"CO₂ évité",v:`${r.co2_yr1} t/an`,ok:true,c:C.green},
+            ].map(k=>(
+              <div key={k.l} className="rounded-xl p-4 border" style={{backgroundColor:C.navy2,borderColor:k.c+"25"}}>
+                <div className="text-xs mb-1" style={{color:C.muted}}>{k.l}</div>
+                <div className="text-lg font-black" style={{color:k.ok?k.c:C.red}}>{k.v}</div>
               </div>
             ))}
           </div>
 
-          {/* Sizing summary */}
-          <div
-            className="rounded-xl border p-4 mb-4"
-            style={{ backgroundColor: C.navy2, borderColor: C.border }}
-          >
-            <div
-              className="font-bold text-xs uppercase tracking-widest mb-3"
-              style={{ color: C.gold }}
-            >
-              Dimensionnement (Eqs 1-5)
-            </div>
+          {/* Sizing */}
+          <div className="rounded-xl border p-4 mb-4" style={{backgroundColor:C.navy2,borderColor:C.border}}>
+            <div className="font-bold text-xs uppercase tracking-widest mb-3" style={{color:C.gold}}>Dimensionnement (Éq. 1-8) & CAPEX (Éq. 31)</div>
             <div className="grid grid-cols-3 md:grid-cols-6 gap-3">
-              {[
-                ["Surface nette (Eq.1)", `${r.a_available} m²`],
-                ["Modules (Eq.2)", `${sys.n_modules}`],
-                ["kWp (Eq.3)", `${sys.p_installed}`],
-                ["FLEH (Eq.5)", `${r.fleh} h`],
-                ["Prod. (Eq.4)", `${(r.e_annual / 1000).toFixed(0)} MWh`],
-                ["CAPEX (Eq.18)", `${(capex / 1e6).toFixed(2)} M DA`],
-              ].map(([l, v]) => (
+              {[[`${r.sizing.a_available} m²`,"Surface nette"],[`${r.sizing.n_modules}`,"Modules"],[`${r.sizing.p_installed} kWp`,"P installée"],
+               [`${r.sizing.n_inverters}`,"Onduleurs"],[`${r.sizing.dc_ac_ratio}`,"DC/AC"],[`${(r.capex/1e6).toFixed(2)} M DA`,"CAPEX (Éq.18)"]
+              ].map(([v,l])=>(
                 <div key={l} className="text-center">
-                  <div className="text-xs" style={{ color: C.muted }}>
-                    {l}
-                  </div>
-                  <div className="font-bold" style={{ color: C.cream }}>
-                    {v}
-                  </div>
+                  <div className="text-sm font-black" style={{color:C.cream}}>{v}</div>
+                  <div className="text-xs" style={{color:C.muted}}>{l}</div>
                 </div>
               ))}
             </div>
           </div>
 
-          {/* Monthly production table */}
-          <div
-            className="rounded-xl border overflow-hidden mb-4"
-            style={{ borderColor: C.border }}
-          >
-            <div
-              className="px-4 py-3 font-bold text-sm"
-              style={{ backgroundColor: C.navy2, color: C.gold }}
-            >
-              Production Mensuelle (Eqs 6-9) & SCR (Eqs 13-17)
+          {/* Monthly table */}
+          <div className="rounded-xl border overflow-hidden mb-4" style={{borderColor:C.border}}>
+            <div className="px-4 py-3 font-bold text-sm" style={{backgroundColor:C.navy2,color:C.gold}}>
+              Production & SCR Mensuels (Éq. 9-30)
             </div>
             <div className="overflow-x-auto">
               <table className="w-full text-xs">
-                <thead>
-                  <tr style={{ backgroundColor: C.navy2 }}>
-                    <th
-                      className="py-2 px-2 text-left"
-                      style={{ color: C.muted }}
-                    >
-                      Indicateur
-                    </th>
-                    {M_SHORT.map((m) => (
-                      <th
-                        key={m}
-                        className="py-2 px-1 text-right"
-                        style={{ color: C.muted }}
-                      >
-                        {m}
-                      </th>
-                    ))}
-                    <th
-                      className="py-2 px-2 text-right font-bold"
-                      style={{ color: C.gold }}
-                    >
-                      TOTAL
-                    </th>
-                  </tr>
-                </thead>
+                <thead><tr style={{backgroundColor:C.navy2}}>
+                  <th className="py-2 px-2 text-left" style={{color:C.muted}}>Indicateur</th>
+                  {M_S.map(m=><th key={m} className="py-2 px-1 text-right" style={{color:C.muted}}>{m}</th>)}
+                  <th className="py-2 px-2 text-right font-bold" style={{color:C.gold}}>TOTAL</th>
+                </tr></thead>
                 <tbody>
                   {[
-                    {
-                      label: "T_cell °C",
-                      vals: r.monthly.map((m) => m.t_cell),
-                      color: "#fb923c",
-                      unit: "°C",
-                      isTotal: false,
-                    },
-                    {
-                      label: "PR_total % (Eq.8)",
-                      vals: r.monthly.map((m) => m.pr_total),
-                      color: C.blue,
-                      unit: "%",
-                      isTotal: false,
-                    },
-                    {
-                      label: "E_PV kWh (Eq.9)",
-                      vals: r.monthly_pv,
-                      color: C.gold,
-                      isTotal: true,
-                    },
-                    {
-                      label: "E_Cons kWh",
-                      vals: r.monthly_cons,
-                      color: C.blue,
-                      isTotal: true,
-                    },
-                    {
-                      label: "SC kWh (Eq.13)",
-                      vals: r.monthly_sc,
-                      color: C.green,
-                      isTotal: true,
-                    },
-                    {
-                      label: "SCR % (Eq.13)",
-                      vals: r.monthly_scr,
-                      color: C.muted,
-                      unit: "%",
-                      isTotal: false,
-                    },
-                  ].map((row) => (
-                    <tr
-                      key={row.label}
-                      className="border-t"
-                      style={{ borderColor: C.border + "30" }}
-                    >
-                      <td
-                        className="py-1.5 px-2 font-semibold text-xs"
-                        style={{ color: row.color }}
-                      >
-                        {row.label}
-                      </td>
-                      {row.vals.map((v, i) => (
-                        <td
-                          key={i}
-                          className="py-1.5 px-1 text-right"
-                          style={{ color: C.light + "90" }}
-                        >
-                          {typeof v === "number" ? v.toLocaleString() : v}
-                          {row.unit ?? ""}
-                        </td>
+                    {label:"PR_total % (Éq.12)",vals:r.monthly.map(m=>m.pr_total),color:"#fb923c",unit:"%",avg:true},
+                    {label:"E_PV kWh (Éq.13)",vals:r.monthly_pv,color:C.gold,sum:true},
+                    {label:"E_Cons kWh",vals:r.monthly_cons,color:C.blue,sum:true},
+                    {label:"E_SC kWh (Éq.24)",vals:r.monthly_sc,color:C.green,sum:true},
+                    {label:"SCR% (Éq.27)",vals:r.monthly_scr,color:C.muted,unit:"%",avg:true},
+                  ].map(row=>(
+                    <tr key={row.label} className="border-t" style={{borderColor:C.border+"30"}}>
+                      <td className="py-1.5 px-2 font-semibold" style={{color:row.color}}>{row.label}</td>
+                      {row.vals.map((v,i)=>(
+                        <td key={i} className="py-1.5 px-1 text-right" style={{color:C.light+"90"}}>
+                          {v.toLocaleString()}{row.unit??""}</td>
                       ))}
-                      <td
-                        className="py-1.5 px-2 text-right font-bold"
-                        style={{ color: row.color }}
-                      >
-                        {row.isTotal
-                          ? row.vals
-                              .reduce((a, b) => a + (b as number), 0)
-                              .toLocaleString()
-                          : row.unit === "%"
-                            ? `${Math.round(row.vals.reduce((a, b) => a + (b as number), 0) / row.vals.length)}%`
-                            : `${(row.vals.reduce((a, b) => a + (b as number), 0) / row.vals.length).toFixed(1)}°C`}
+                      <td className="py-1.5 px-2 text-right font-bold" style={{color:row.color}}>
+                        {row.sum?row.vals.reduce((a,b)=>a+b,0).toLocaleString():
+                          `${Math.round(row.vals.reduce((a,b)=>a+b,0)/row.vals.length)}%`}
                       </td>
                     </tr>
                   ))}
@@ -3242,128 +1563,61 @@ export default function SolarStudyPro() {
             </div>
           </div>
 
-          {/* 2 Scenario cards */}
-          <div className="grid grid-cols-2 gap-3 mb-4">
-            {(
-              [
-                {
-                  title: `Sc1 — Sans subvention`,
-                  cap: capex,
-                  npv: r.npv_sc1,
-                  irr: r.irr_sc1,
-                  spp: r.spp_sc1,
-                  dpp: r.dpp_sc1,
-                  pi: r.pi_sc1,
-                  color: C.gold,
-                },
-                {
-                  title: `Sc2 — Subvention ${fin.subsidy_rate}%`,
-                  cap: r.capex_sc2,
-                  npv: r.npv_sc2,
-                  irr: r.irr_sc2,
-                  spp: r.spp_sc2,
-                  dpp: r.dpp_sc2,
-                  pi: r.pi_sc2,
-                  color: C.blue,
-                },
-              ] as const
-            ).map((sc) => (
-              <div
-                key={sc.title}
-                className="rounded-xl border p-4"
-                style={{
-                  backgroundColor: C.navy2,
-                  borderColor: sc.color + "33",
-                }}
-              >
-                <div
-                  className="font-bold text-sm mb-3"
-                  style={{ color: sc.color }}
-                >
-                  {sc.title}
-                </div>
-                {[
-                  ["CAPEX", sc.cap.toLocaleString() + " DA"],
-                  ["VAN (Eq.27)", sc.npv.toLocaleString() + " DA"],
-                  ["TRI (Eq.28)", sc.irr + "%"],
-                  ["DRS (Eq.23)", sc.spp + " ans"],
-                  ["DRA (Eq.29)", (sc.dpp ?? ">25") + " ans"],
-                  ["IP (Eq.31)", String(sc.pi)],
-                  ["LCOE (Eq.30)", r.lcoe + " DA/kWh"],
-                ].map(([k, v]) => (
-                  <div
-                    key={k}
-                    className="flex justify-between text-xs py-1 border-b"
-                    style={{ borderColor: C.border + "30" }}
-                  >
-                    <span style={{ color: C.muted }}>{k}</span>
-                    <span className="font-semibold" style={{ color: C.light }}>
-                      {v}
-                    </span>
+          {/* 3 scenarios */}
+          <div className="grid grid-cols-3 gap-3 mb-4">
+            {[
+              {title:"Sc1 — Sans subvention",npv:r.npv_sc1,irr:r.irr_sc1,spp:r.spp_sc1,dpp:r.dpp_sc1,pi:r.pi_sc1,cap:r.capex,c:C.gold},
+              {title:`Sc2 — ${fin.subsidy_rate}% Subvention`,npv:r.npv_sc2,irr:r.irr_sc2,spp:r.spp_sc2,dpp:r.dpp_sc2,pi:r.pi_sc2,cap:r.capex_sc2,c:C.blue},
+              {title:`Sc3 — Crédit ${fin.loan_rate}%/${fin.loan_years}ans`,npv:r.npv_sc3,irr:r.irr_sc3,spp:0,dpp:r.dpp_sc3,pi:r.pi_sc3,cap:r.capex,c:C.green},
+            ].map(sc=>(
+              <div key={sc.title} className="rounded-xl border p-4" style={{backgroundColor:C.navy2,borderColor:sc.c+"33"}}>
+                <div className="font-bold text-xs mb-3" style={{color:sc.c}}>{sc.title}</div>
+                {[["CAPEX",sc.cap.toLocaleString()+" DA"],["VAN (Éq.42)",sc.npv.toLocaleString()+" DA"],
+                  ["TRI (Éq.48)",sc.irr+"%"],["DRA (Éq.47)",(sc.dpp??">25")+" ans"],["IP (Éq.50)",String(sc.pi)],
+                ].map(([k,v])=>(
+                  <div key={k} className="flex justify-between text-xs py-1 border-b" style={{borderColor:C.border+"30"}}>
+                    <span style={{color:C.muted}}>{k}</span>
+                    <span className="font-semibold" style={{color:C.light}}>{v}</span>
                   </div>
                 ))}
               </div>
             ))}
           </div>
 
-          {/* Environmental */}
-          <div
-            className="rounded-xl border p-4 mb-4"
-            style={{ backgroundColor: C.navy2, borderColor: C.green + "22" }}
-          >
-            <div className="font-bold text-sm mb-3" style={{ color: C.green }}>
-              Impact Environnemental (Eqs 33-35)
+          {/* Break-even + net metering */}
+          <div className="grid grid-cols-2 gap-3 mb-4">
+            <div className="rounded-xl border p-4" style={{backgroundColor:C.navy2,borderColor:C.border}}>
+              <div className="font-bold text-xs mb-2" style={{color:C.gold}}>Break-Even (Éq.51)</div>
+              <div className="text-xs" style={{color:C.muted}}>SCR break-even: <span style={{color:C.cream}}>{r.be_scr}%</span> (actuel: {r.scr_annual}%, marge: {(r.scr_annual-r.be_scr).toFixed(0)} pts)</div>
+              <div className="text-xs mt-1" style={{color:C.muted}}>T₀ break-even: <span style={{color:C.cream}}>{r.be_tariff} DA/kWh</span> (actuel: {r.t0})</div>
             </div>
+            <div className="rounded-xl border p-4" style={{backgroundColor:C.navy2,borderColor:C.green+"22"}}>
+              <div className="font-bold text-xs mb-2" style={{color:C.green}}>Comptage Net (Éq.52-53)</div>
+              <div className="text-xs" style={{color:C.muted}}>Surplus exporté (Éq.30): <span style={{color:C.cream}}>{r.e_surplus.toLocaleString()} kWh/an</span></div>
+              <div className="text-xs mt-1" style={{color:C.muted}}>Revenus NM: <span style={{color:C.cream}}>{r.nm_revenue.toLocaleString()} DA/an</span> | VAN NM: {r.npv_nm.toLocaleString()} DA</div>
+            </div>
+          </div>
+
+          {/* Environmental */}
+          <div className="rounded-xl border p-4 mb-4" style={{backgroundColor:C.navy2,borderColor:C.green+"22"}}>
+            <div className="font-bold text-xs mb-3" style={{color:C.green}}>Impact Environnemental (Éq. 54-55)</div>
             <div className="grid grid-cols-4 gap-3 text-center">
-              {[
-                ["tCO2/an", String(r.co2_yr1), "CO2 évité (Eq.33)"],
-                [`${r.co2_25yr} t`, `sur 25 ans`, "CO2 total (Eq.34)"],
-                ["arbres", String(r.trees_equiv), "Équivalent arbres"],
-                [
-                  "DA/an",
-                  r.nm_revenue.toLocaleString(),
-                  "Net Metering (Eq.35)",
-                ],
-              ].map(([unit, val, lbl]) => (
-                <div
-                  key={lbl}
-                  className="rounded-lg p-3"
-                  style={{ backgroundColor: C.green + "0a" }}
-                >
-                  <div
-                    className="text-xl font-black"
-                    style={{ color: C.green }}
-                  >
-                    {val}
-                  </div>
-                  <div className="text-xs" style={{ color: C.green + "80" }}>
-                    {unit}
-                  </div>
-                  <div className="text-xs mt-0.5" style={{ color: C.muted }}>
-                    {lbl}
-                  </div>
+              {[["tCO₂/an",r.co2_yr1,"CO₂ évité"],[`${r.co2_25yr}t`,"25 ans","CO₂ total"],
+                [r.trees_yr,"arbres","Équiv. arbres"],[r.vehi_yr,"veh.","Véhicules"],
+              ].map(([v,u,l])=>(
+                <div key={l as string} className="rounded-lg p-3" style={{backgroundColor:C.green+"0a"}}>
+                  <div className="text-xl font-black" style={{color:C.green}}>{v}</div>
+                  <div className="text-xs" style={{color:C.green+"80"}}>{u}</div>
+                  <div className="text-xs mt-0.5" style={{color:C.muted}}>{l}</div>
                 </div>
               ))}
             </div>
           </div>
 
           <div className="flex gap-3">
-            <button
-              onClick={() => setStep(4)}
-              className="py-3 px-6 rounded-xl text-sm"
-              style={{ border: `1px solid ${C.border}`, color: C.muted }}
-            >
-              Modifier
-            </button>
-            <button
-              onClick={downloadPDF}
-              disabled={genPdf}
-              className="flex-grow py-3 rounded-xl font-bold transition-opacity hover:opacity-90 disabled:opacity-40"
-              style={{ backgroundColor: C.gold, color: C.navy }}
-            >
-              {genPdf
-                ? "Génération PDF..."
-                : "Télécharger Rapport PDF Complet (9 pages)"}
+            <button onClick={()=>setStep(5)} className="py-3 px-6 rounded-xl text-sm" style={{border:`1px solid ${C.border}`,color:C.muted}}>Modifier</button>
+            <button onClick={dlPDF} disabled={genPdf} className="flex-grow py-3 rounded-xl font-bold transition-opacity hover:opacity-90 disabled:opacity-40" style={{backgroundColor:C.gold,color:C.navy}}>
+              {genPdf?"Génération PDF (12 pages)...":"📄 Télécharger Rapport PDF Complet (12 pages)"}
             </button>
           </div>
         </div>
